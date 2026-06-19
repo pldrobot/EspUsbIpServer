@@ -1,17 +1,17 @@
 {
-  "name": "esp_usbip_server",
+  "name": "EspUsbIpServer",
   "version": "1.0.0",
   "description": "USB/IP server library for ESP32-S3 USB Host mode",
   "keywords": ["usb", "usbip", "esp32", "esp32s3", "usb-host", "printer", "network"],
   "authors": [
     {
       "name": "PLDRobot",
-      "email": "pasan.d@synergentl.com"
+      "email": "pldrobots@gmail.com"
     }
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/PLDRobot/ESP32S3-USBIP-Server"
+    "url": "https://github.com/pldrobot/EspUsbIpServer"
   },
   "frameworks": ["arduino"],
   "platforms": ["espressif32"],
