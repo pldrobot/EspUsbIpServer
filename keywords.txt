@@ -1,0 +1,73 @@
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+UsbDevice	KEYWORD1
+UsbIpServer	KEYWORD1
+UsbIpSessionRecord	KEYWORD1
+UsbDeviceState	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+# UsbDevice
+begin	KEYWORD2
+task	KEYWORD2
+sendData	KEYWORD2
+readData	KEYWORD2
+sendMaintCommand	KEYWORD2
+softReset	KEYWORD2
+setMaintenanceMode	KEYWORD2
+isInMaintenanceMode	KEYWORD2
+submitControlTransfer	KEYWORD2
+submitBulkOut	KEYWORD2
+submitBulkIn	KEYWORD2
+getState	KEYWORD2
+isConnected	KEYWORD2
+isReady	KEYWORD2
+isBusy	KEYWORD2
+getManufacturer	KEYWORD2
+getProduct	KEYWORD2
+getDeviceId	KEYWORD2
+getVendorId	KEYWORD2
+getProductId	KEYWORD2
+getEpOut	KEYWORD2
+getEpIn	KEYWORD2
+getIfaceNum	KEYWORD2
+getDevDescRaw	KEYWORD2
+getDevDescLen	KEYWORD2
+getCfgDescRaw	KEYWORD2
+getCfgDescLen	KEYWORD2
+
+# UsbIpServer
+start	KEYWORD2
+stop	KEYWORD2
+isClientAttached	KEYWORD2
+kickClient	KEYWORD2
+statusJson	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+DEVICE_DISCONNECTED	LITERAL1
+DEVICE_CONNECTED	LITERAL1
+DEVICE_READY	LITERAL1
+DEVICE_BUSY	LITERAL1
+DEVICE_MAINTENANCE	LITERAL1
+DEVICE_ERROR	LITERAL1
+
+USBIP_PORT	LITERAL1
+USBIP_VERSION	LITERAL1
+USBIP_BUSID	LITERAL1
+USBIP_BUSNUM	LITERAL1
+USBIP_DEVNUM	LITERAL1
+USBIP_SPEED_HIGH	LITERAL1
+USBIP_LOG_LEVEL	LITERAL1
+
+USB_CLASS_PRINTER	LITERAL1
+USB_SUBCLASS_PRINTER	LITERAL1
+USB_PROTOCOL_UNIDIR	LITERAL1
+USB_PROTOCOL_BIDIR	LITERAL1
+USB_PROTOCOL_1284	LITERAL1
