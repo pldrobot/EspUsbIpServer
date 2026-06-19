@@ -4,7 +4,7 @@
 UsbDevice::UsbDevice()
     : _state(DEVICE_DISCONNECTED), _maintenanceMode(false),
       _vendorId(0), _productId(0),
-      _clientHandle(nullptr), _deviceHandle(nullptr),
+      _taskHandle(nullptr), _clientHandle(nullptr), _deviceHandle(nullptr),
       _epOut(0), _epIn(0), _epOutMPS(64), _epInMPS(64), _ifaceNum(0),
       _devDescLen(0), _cfgDescLen(0) {}
 
@@ -27,11 +27,35 @@ bool UsbDevice::begin() {
         return false;
     }
 
-    _USBIP_LOGI("USB Host ready, waiting for device...");
+    BaseType_t core = (xPortGetCoreID() ^ 1);
+    xTaskCreatePinnedToCore(_deviceTask, "usb_host", 4096, this, 5, &_taskHandle, core);
+    _USBIP_LOGI("USB Host ready (core %d), waiting for device...", (int)core);
     return true;
 }
 
-void UsbDevice::task() {
+void UsbDevice::stop() {
+    if (_taskHandle) {
+        vTaskSuspend(_taskHandle);
+        _USBIP_LOGI("USB Host task suspended");
+    }
+}
+
+void UsbDevice::start() {
+    if (_taskHandle) {
+        vTaskResume(_taskHandle);
+        _USBIP_LOGI("USB Host task resumed");
+    }
+}
+
+void UsbDevice::_deviceTask(void* arg) {
+    UsbDevice* self = static_cast<UsbDevice*>(arg);
+    for (;;) {
+        self->_poll();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+void UsbDevice::_poll() {
     if (!_clientHandle) return;
     usb_host_lib_handle_events(0, NULL);
     usb_host_client_handle_events(_clientHandle, 0);

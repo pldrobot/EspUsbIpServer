@@ -105,13 +105,13 @@ void UsbIpServer::_poll() {
     if (_server.hasClient()) {
         WiFiClient incoming = _server.accept();
         if (_client && _client.connected()) {
-            _USBIP_LOGI("New client %s — kicking current %s",
+            _USBIP_LOGW("Rejected %s — device held by %s",
                         incoming.remoteIP().toString().c_str(), _curIP);
-            _onDisconnect();
-            _client.stop();
+            incoming.stop();
+        } else {
+            _client = incoming;
+            _onConnect(_client.remoteIP().toString());
         }
-        _client = incoming;
-        _onConnect(_client.remoteIP().toString());
     }
 
     if (_client && !_client.connected()) {
@@ -140,9 +140,9 @@ void UsbIpServer::begin(UsbDevice* device) {
     _device = device;
     _server.begin(USBIP_PORT);
     _server.setNoDelay(true);
-    BaseType_t core = xPortGetCoreID();
+    BaseType_t core = (xPortGetCoreID() ^ 1);
     xTaskCreatePinnedToCore(_serverTask, "usbip_srv", 4096, this, 4, &_taskHandle, core);
-    _USBIP_LOGI("Server on port %d (core %d)", USBIP_PORT, (int)core);
+    _USBIP_LOGI("Server on port %d (core %d) — concurrent connections rejected", USBIP_PORT, (int)core);
 }
 
 void UsbIpServer::stop() {

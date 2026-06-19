@@ -33,11 +33,12 @@ class UsbDevice {
 public:
     UsbDevice();
 
-    // Call once from a dedicated task on Core 1 before entering the task loop
+    // Install USB Host driver and spawn the event task on the opposite core.
     bool begin();
 
-    // Drive USB Host events — call every ~10 ms from a pinned Core 1 task
-    void task();
+    // Suspend / resume the USB Host event task.
+    void stop();
+    void start();
 
     // Normal data path — rejected while USB/IP holds the maintenance lock
     int sendData(const uint8_t* data, size_t length);
@@ -90,6 +91,7 @@ private:
     String   _manufacturer, _product, _deviceId;
     uint16_t _vendorId, _productId;
 
+    TaskHandle_t             _taskHandle;
     usb_host_client_handle_t _clientHandle;
     usb_device_handle_t      _deviceHandle;
     uint8_t  _epOut, _epIn;
@@ -100,6 +102,9 @@ private:
     size_t  _devDescLen;
     uint8_t _cfgDescBuf[CFG_DESC_BUF_SIZE];
     size_t  _cfgDescLen;
+
+    static void _deviceTask(void* arg);
+    void        _poll();
 
     static void _clientEventCallback(const usb_host_client_event_msg_t*, void*);
     void _handleClientEvent(const usb_host_client_event_msg_t*);
