@@ -1,6 +1,9 @@
 #include "UsbIpServer.h"
 #include "UsbDevice.h"
 #include "EspUsbIpLog.h"
+#include <errno.h>
+#include <lwip/sockets.h>
+#include <lwip/tcp.h>
 
 // ── Big-endian helpers ────────────────────────────────────────────────────────
 
@@ -61,6 +64,7 @@ void UsbIpServer::_onConnect(const String& ip) {
     strncpy(_curIP, ip.c_str(), sizeof(_curIP) - 1);
     _connectedMs = millis();
     _attachedMs  = 0;
+    _attached    = false;   // a new TCP connection can never belong to an attached session
     _USBIP_LOGI("Connected: %s", _curIP);
 }
 
@@ -101,25 +105,65 @@ void UsbIpServer::_serverTask(void* arg) {
     }
 }
 
+// NB: WiFiClient is NetworkClient, whose operator bool() calls connected(), so
+// `_client && !_client.connected()` can never be true. Session state is tracked
+// with _curIP instead ("we believe a session exists").
+
+bool UsbIpServer::_peerGone() {
+    int fd = _client.fd();
+    if (fd < 0) return true;
+    uint8_t b;
+    int r = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r == 0) return true;                                   // orderly shutdown (FIN)
+    if (r < 0 && errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) return true;
+    return false;
+}
+
+bool UsbIpServer::_sessionAlive() {
+    return _client.connected() && !_peerGone();
+}
+
+void UsbIpServer::_dropSession() {
+    if (_curIP[0]) _onDisconnect();   // history, callbacks, maintenance mode, resets state
+    _client.stop();                   // safe on a closed / never-opened client
+    _attached = false;
+}
+
+// Detect vanished peers (power loss, network drop) that never send FIN/RST: ~35 s.
+void UsbIpServer::_enableKeepAlive() {
+    int fd = _client.fd();
+    if (fd < 0) return;
+    int on = 1, idle = 20, intvl = 5, cnt = 3;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &on, sizeof(on));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+}
+
 void UsbIpServer::_poll() {
+    if (_kickReq) {
+        _kickReq = false;
+        _dropSession();
+        _USBIP_LOGI("Client kicked by caller");
+    }
+
     if (_server.hasClient()) {
         WiFiClient incoming = _server.accept();
-        if (_client && _client.connected()) {
+        if (_curIP[0] && _sessionAlive()) {
             _USBIP_LOGW("Rejected %s — device held by %s",
                         incoming.remoteIP().toString().c_str(), _curIP);
             incoming.stop();
         } else {
+            _dropSession();           // clear any stale session before taking the new one
             _client = incoming;
+            _enableKeepAlive();
             _onConnect(_client.remoteIP().toString());
         }
     }
 
-    if (_client && !_client.connected()) {
-        if (_curIP[0]) _onDisconnect();
-        _client.stop();
-    }
-
-    if (!_client || !_client.connected()) return;
+    // Drop detection
+    if (_curIP[0] && !_sessionAlive()) _dropSession();
+    if (!_curIP[0]) return;
 
     if (!_attached) {
         if (_client.available() >= 8) {
@@ -147,8 +191,9 @@ void UsbIpServer::begin(UsbDevice* device) {
 
 void UsbIpServer::stop() {
     if (_taskHandle) {
-        kickClient();
         vTaskSuspend(_taskHandle);
+        _kickReq = false;
+        _dropSession();
         _USBIP_LOGI("Server stopped");
     }
 }
@@ -157,14 +202,6 @@ void UsbIpServer::start() {
     if (_taskHandle) {
         vTaskResume(_taskHandle);
         _USBIP_LOGI("Server started");
-    }
-}
-
-void UsbIpServer::kickClient() {
-    if (_client && _client.connected()) {
-        _onDisconnect();
-        _client.stop();
-        _USBIP_LOGI("Client kicked by caller");
     }
 }
 

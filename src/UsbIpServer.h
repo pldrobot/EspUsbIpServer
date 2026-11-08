@@ -49,8 +49,10 @@ public:
     void onClientConnect(UsbIpConnectCallback cb)       { _onConnectCb    = cb; }
     void onClientDisconnect(UsbIpDisconnectCallback cb) { _onDisconnectCb = cb; }
 
-    // Force-disconnect the current client.
-    void kickClient();
+    // Force-disconnect the current client. Unconditional: works even when the
+    // peer's socket is already gone. Safe to call from any task (the drop is
+    // performed by the server task within ~1 ms).
+    void kickClient() { _kickReq = true; }
 
     // JSON status blob: attached state, current client, session history.
     String statusJson() const;
@@ -60,6 +62,7 @@ private:
     WiFiClient   _client;
     UsbDevice*   _device     = nullptr;
     bool         _attached   = false;
+    volatile bool _kickReq   = false;
     TaskHandle_t _taskHandle = nullptr;
 
     UsbIpConnectCallback    _onConnectCb;
@@ -75,6 +78,14 @@ private:
 
     static void _serverTask(void* arg);
     void        _poll();
+
+    // Session teardown that does not depend on connected(): records history,
+    // resets state and closes the socket. Safe to call with no session.
+    void _dropSession();
+    // True when the peer closed (FIN/RST) or the socket is unusable.
+    bool _peerGone();
+    bool _sessionAlive();
+    void _enableKeepAlive();
 
     void _onConnect(const String& ip);
     void _onAttach();
