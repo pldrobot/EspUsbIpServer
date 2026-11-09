@@ -28,7 +28,7 @@ bool UsbDevice::begin() {
     }
 
     BaseType_t core = (xPortGetCoreID() ^ 1);
-    xTaskCreatePinnedToCore(_deviceTask, "usb_host", 4096, this, 5, &_taskHandle, core);
+    xTaskCreatePinnedToCore(_deviceTask, "usb_host", 8192, this, 5, &_taskHandle, core);
     _USBIP_LOGI("USB Host ready (core %d), waiting for device...", (int)core);
     return true;
 }
@@ -243,19 +243,36 @@ int UsbDevice::_bulkTransfer(uint8_t endpoint, uint8_t* buffer,
     xfer->num_bytes        = length;
     xfer->timeout_ms       = timeoutMs;
 
-    volatile bool done = false;
-    xfer->callback = [](usb_transfer_t* t){ *(volatile bool*)t->context = true; };
-    xfer->context  = (void*)&done;
+    // Completion flag lives in xfer->context (not on the stack): the callback may
+    // fire after this function has returned if the transfer could not be cancelled.
+    xfer->callback = [](usb_transfer_t* t){ t->context = (void*)1; };
+    xfer->context  = nullptr;
 
     esp_err_t err = usb_host_transfer_submit(xfer);
     if (err != ESP_OK) { usb_host_transfer_free(xfer); return -1; }
 
-    unsigned long deadline = millis() + timeoutMs;
-    while (!done && millis() < deadline)
+    unsigned long deadline = millis() + timeoutMs + 500;   // let the stack's own timeout fire first
+    while (!xfer->context && millis() < deadline)
         usb_host_client_handle_events(_clientHandle, 10);
 
+    if (!xfer->context) {
+        // Still in flight: cancel it. Freeing an in-flight transfer corrupts memory
+        // (this was the mid-print reboot).
+        _USBIP_LOGW("USB transfer ep 0x%02X timed out, cancelling", endpoint);
+        usb_host_endpoint_halt(_deviceHandle, endpoint);
+        usb_host_endpoint_flush(_deviceHandle, endpoint);
+        unsigned long cancelDeadline = millis() + 2000;
+        while (!xfer->context && millis() < cancelDeadline)
+            usb_host_client_handle_events(_clientHandle, 10);
+        usb_host_endpoint_clear(_deviceHandle, endpoint);
+        if (!xfer->context) {
+            _USBIP_LOGE("USB transfer could not be cancelled; leaking it to stay safe");
+            return -1;   // never free a transfer the host stack still owns
+        }
+    }
+
     int result = -1;
-    if (done && xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
+    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
         result = xfer->actual_num_bytes;
         if (isIn) memcpy(buffer, xfer->data_buffer, result);
     }

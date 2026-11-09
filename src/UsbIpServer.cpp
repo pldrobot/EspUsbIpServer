@@ -185,7 +185,7 @@ void UsbIpServer::begin(UsbDevice* device) {
     _server.begin(USBIP_PORT);
     _server.setNoDelay(true);
     BaseType_t core = (xPortGetCoreID() ^ 1);
-    xTaskCreatePinnedToCore(_serverTask, "usbip_srv", 4096, this, 4, &_taskHandle, core);
+    xTaskCreatePinnedToCore(_serverTask, "usbip_srv", 8192, this, 4, &_taskHandle, core);
     _USBIP_LOGI("Server on port %d (core %d) — concurrent connections rejected", USBIP_PORT, (int)core);
 }
 
