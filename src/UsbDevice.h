@@ -29,6 +29,27 @@ enum UsbDeviceState {
 #define DEV_DESC_BUF_SIZE   18
 #define CFG_DESC_BUF_SIZE   512
 
+// Generic enumeration tables — this library claims and forwards *any* bulk or
+// interrupt endpoint on *any* interface (alternate setting 0 only), not just
+// a USB-printer interface. Isochronous endpoints and non-default alternate
+// settings are out of scope (see README).
+#define USBIP_MAX_IFACES  8
+#define USBIP_MAX_EPS     16
+
+struct UsbIpIface {
+    uint8_t ifaceNum;
+    uint8_t ifaceClass;
+    uint8_t ifaceSubClass;
+    uint8_t ifaceProtocol;
+};
+
+struct UsbIpEndpoint {
+    uint8_t  address;        // bEndpointAddress, direction bit included
+    uint8_t  type;           // usb_transfer_type_t: BULK or INTR
+    uint16_t maxPacketSize;
+    uint8_t  interval;       // bInterval (informational, interrupt endpoints)
+};
+
 class UsbDevice {
 public:
     UsbDevice();
@@ -40,7 +61,9 @@ public:
     void stop();
     void start();
 
-    // Normal data path — rejected while USB/IP holds the maintenance lock
+    // Normal data path — rejected while USB/IP holds the maintenance lock.
+    // Uses the device's first bulk OUT/IN endpoint pair (set during
+    // enumeration); for multi-endpoint devices, use submitTransfer() instead.
     int sendData(const uint8_t* data, size_t length);
     int readData(uint8_t* buffer, size_t maxLength, uint32_t timeoutMs = 2000);
 
@@ -49,6 +72,8 @@ public:
                           uint8_t* response = nullptr,
                           size_t   responseMaxLen = 0,
                           uint32_t responseTimeoutMs = 2000);
+    // USB-printer SOFT_RESET — no-op (returns false) unless a printer-class
+    // interface (0x07/0x01) is actually present among the claimed interfaces.
     bool softReset();
 
     // Exclusive lock held by the USB/IP server while a client is attached
@@ -61,6 +86,11 @@ public:
                               uint32_t timeoutMs = 3000);
     int submitBulkOut(const uint8_t* data, size_t len, uint32_t timeoutMs = 5000);
     int submitBulkIn(uint8_t*  buf,  size_t maxLen,    uint32_t timeoutMs = 3000);
+    // Generic bulk/interrupt transfer to any claimed endpoint, addressed by
+    // its real bEndpointAddress (direction bit included) — this is what lets
+    // UsbIpServer forward a URB to the correct pipe on a multi-endpoint
+    // device instead of assuming a single remembered pair.
+    int submitTransfer(uint8_t epAddr, uint8_t* buf, size_t len, uint32_t timeoutMs = 5000);
 
     // State
     UsbDeviceState getState()   const { return _state; }
@@ -76,7 +106,13 @@ public:
     uint16_t getProductId()    const { return _productId; }
     uint8_t  getEpOut()        const { return _epOut; }
     uint8_t  getEpIn()         const { return _epIn; }
-    uint8_t  getIfaceNum()     const { return _ifaceNum; }
+    uint8_t  getIfaceNum()     const { return _ifaceCount ? _ifaces[0].ifaceNum : 0; }
+    usb_speed_t getSpeed()     const { return _speed; }
+
+    // Every interface actually claimed on the current device (not just one) —
+    // used by UsbIpServer to report real descriptors instead of a fixed tuple.
+    int  getIfaceCount() const { return _ifaceCount; }
+    bool getIfaceDesc(int i, uint8_t out[4]) const;
 
     // Raw descriptor bytes forwarded to the USB/IP client during import
     const uint8_t* getDevDescRaw() const { return _devDescBuf; }
@@ -94,9 +130,19 @@ private:
     TaskHandle_t             _taskHandle;
     usb_host_client_handle_t _clientHandle;
     usb_device_handle_t      _deviceHandle;
+
+    // "Primary" bulk pair — the first bulk IN/OUT endpoints found during
+    // enumeration — kept for sendData()/readData()/sendMaintCommand(), which
+    // predate (and don't need) the full generic endpoint table below.
     uint8_t  _epOut, _epIn;
     uint16_t _epOutMPS, _epInMPS;
-    uint8_t  _ifaceNum;
+
+    usb_speed_t _speed;
+
+    UsbIpIface    _ifaces[USBIP_MAX_IFACES];
+    int           _ifaceCount;
+    UsbIpEndpoint _eps[USBIP_MAX_EPS];
+    int           _epCount;
 
     uint8_t _devDescBuf[DEV_DESC_BUF_SIZE];
     size_t  _devDescLen;
@@ -109,10 +155,12 @@ private:
     static void _clientEventCallback(const usb_host_client_event_msg_t*, void*);
     void _handleClientEvent(const usb_host_client_event_msg_t*);
     bool _openDevice(uint8_t devAddr);
-    bool _findDeviceInterface();
-    bool _claimInterface();
+    bool _enumerateInterfaces();
     void _closeDevice();
     bool _getDeviceId();
+
+    const UsbIpEndpoint* _findEndpoint(uint8_t address) const;
+    int  _printerIfaceNum() const;
 
     int _bulkTransfer(uint8_t endpoint, uint8_t* buffer, size_t length, uint32_t timeoutMs);
 };

@@ -5,7 +5,8 @@ UsbDevice::UsbDevice()
     : _state(DEVICE_DISCONNECTED), _maintenanceMode(false),
       _vendorId(0), _productId(0),
       _taskHandle(nullptr), _clientHandle(nullptr), _deviceHandle(nullptr),
-      _epOut(0), _epIn(0), _epOutMPS(64), _epInMPS(64), _ifaceNum(0),
+      _epOut(0), _epIn(0), _epOutMPS(64), _epInMPS(64), _speed(USB_SPEED_FULL),
+      _ifaceCount(0), _epCount(0),
       _devDescLen(0), _cfgDescLen(0) {}
 
 bool UsbDevice::begin() {
@@ -101,19 +102,27 @@ bool UsbDevice::_openDevice(uint8_t devAddr) {
         memcpy(_cfgDescBuf, cfgDesc, _cfgDescLen);
     }
 
-    if (!_findDeviceInterface() || !_claimInterface()) {
-        _USBIP_LOGE("USB No printer interface found or cannot claim");
+    usb_device_info_t info;
+    _speed = (usb_host_device_info(_deviceHandle, &info) == ESP_OK) ? info.speed : USB_SPEED_FULL;
+
+    if (!_enumerateInterfaces()) {
+        _USBIP_LOGE("USB No usable interface found or cannot claim");
         _closeDevice();
         return false;
     }
 
-    _getDeviceId();
+    _getDeviceId();   // no-op unless a printer-class interface was claimed
     _state = DEVICE_READY;
-    _USBIP_LOGI("USB Device ready");
+    _USBIP_LOGI("USB Device ready (speed=%s, %d interface(s), %d endpoint(s))",
+                _speed == USB_SPEED_LOW ? "low" : "full", _ifaceCount, _epCount);
     return true;
 }
 
-bool UsbDevice::_findDeviceInterface() {
+// Walk every interface in the active configuration (alternate setting 0
+// only), claiming each one and recording its class/subclass/protocol plus
+// every bulk/interrupt endpoint it exposes. Isochronous endpoints and
+// non-default alternate settings are skipped — see README's scope notes.
+bool UsbDevice::_enumerateInterfaces() {
     const usb_config_desc_t* cfgDesc;
     if (usb_host_get_active_config_descriptor(_deviceHandle, &cfgDesc) != ESP_OK)
         return false;
@@ -128,65 +137,101 @@ bool UsbDevice::_findDeviceInterface() {
 
         if (desc->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
             const usb_intf_desc_t* iface = (const usb_intf_desc_t*)desc;
-            if (iface->bInterfaceClass    == USB_CLASS_PRINTER &&
-                iface->bInterfaceSubClass == USB_SUBCLASS_PRINTER) {
 
-                _ifaceNum = iface->bInterfaceNumber;
-                _USBIP_LOGI("USB Printer interface #%d protocol=%d",
-                            _ifaceNum, iface->bInterfaceProtocol);
+            if (iface->bAlternateSetting == 0 && _ifaceCount < USBIP_MAX_IFACES) {
+                esp_err_t err = usb_host_interface_claim(_clientHandle, _deviceHandle,
+                                                          iface->bInterfaceNumber,
+                                                          iface->bAlternateSetting);
+                if (err == ESP_OK) {
+                    _ifaces[_ifaceCount++] = { iface->bInterfaceNumber, iface->bInterfaceClass,
+                                                iface->bInterfaceSubClass, iface->bInterfaceProtocol };
+                    _USBIP_LOGI("USB Interface #%d class=0x%02X/0x%02X/0x%02X claimed",
+                                iface->bInterfaceNumber, iface->bInterfaceClass,
+                                iface->bInterfaceSubClass, iface->bInterfaceProtocol);
 
-                int epOff = offset + desc->bLength;
-                for (int i = 0; i < iface->bNumEndpoints && epOff < total; i++) {
-                    const usb_standard_desc_t* raw = (const usb_standard_desc_t*)(p + epOff);
-                    if (raw->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
-                        const usb_ep_desc_t* ep = (const usb_ep_desc_t*)raw;
-                        if ((ep->bmAttributes & 0x03) == USB_BM_ATTRIBUTES_XFER_BULK) {
-                            if (ep->bEndpointAddress & 0x80) {
-                                _epIn    = ep->bEndpointAddress;
-                                _epInMPS = ep->wMaxPacketSize;
-                                _USBIP_LOGI("USB Bulk IN  ep=0x%02X mps=%d", _epIn, _epInMPS);
-                            } else {
-                                _epOut    = ep->bEndpointAddress;
-                                _epOutMPS = ep->wMaxPacketSize;
-                                _USBIP_LOGI("USB Bulk OUT ep=0x%02X mps=%d", _epOut, _epOutMPS);
+                    int epOff = offset + desc->bLength;
+                    for (int i = 0; i < iface->bNumEndpoints && epOff < total; i++) {
+                        const usb_standard_desc_t* raw = (const usb_standard_desc_t*)(p + epOff);
+                        if (raw->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+                            const usb_ep_desc_t* ep = (const usb_ep_desc_t*)raw;
+                            usb_transfer_type_t xtype = USB_EP_DESC_GET_XFERTYPE(ep);
+                            if ((xtype == USB_TRANSFER_TYPE_BULK || xtype == USB_TRANSFER_TYPE_INTR) &&
+                                _epCount < USBIP_MAX_EPS) {
+                                _eps[_epCount++] = { ep->bEndpointAddress, (uint8_t)xtype,
+                                                      ep->wMaxPacketSize, ep->bInterval };
+                                _USBIP_LOGI("USB %s ep=0x%02X mps=%d",
+                                            xtype == USB_TRANSFER_TYPE_BULK ? "Bulk" : "Intr",
+                                            ep->bEndpointAddress, ep->wMaxPacketSize);
+
+                                // Remember the first bulk pair for the legacy single-pair API.
+                                if (xtype == USB_TRANSFER_TYPE_BULK) {
+                                    if ((ep->bEndpointAddress & 0x80) && !_epIn) {
+                                        _epIn    = ep->bEndpointAddress;
+                                        _epInMPS = ep->wMaxPacketSize;
+                                    } else if (!(ep->bEndpointAddress & 0x80) && !_epOut) {
+                                        _epOut    = ep->bEndpointAddress;
+                                        _epOutMPS = ep->wMaxPacketSize;
+                                    }
+                                }
                             }
                         }
+                        epOff += raw->bLength;
                     }
-                    epOff += raw->bLength;
+                } else {
+                    _USBIP_LOGW("USB Interface #%d claim failed: %s",
+                                iface->bInterfaceNumber, esp_err_to_name(err));
                 }
-                return (_epOut != 0);
             }
         }
         offset += desc->bLength;
     }
-    return false;
+
+    return (_ifaceCount > 0 && _epCount > 0);
 }
 
-bool UsbDevice::_claimInterface() {
-    esp_err_t err = usb_host_interface_claim(_clientHandle, _deviceHandle, _ifaceNum, 0);
-    if (err != ESP_OK) {
-        _USBIP_LOGE("USB Claim interface failed: %s", esp_err_to_name(err));
-        return false;
-    }
+bool UsbDevice::getIfaceDesc(int i, uint8_t out[4]) const {
+    if (i < 0 || i >= _ifaceCount) return false;
+    out[0] = _ifaces[i].ifaceClass;
+    out[1] = _ifaces[i].ifaceSubClass;
+    out[2] = _ifaces[i].ifaceProtocol;
+    out[3] = 0;
     return true;
+}
+
+const UsbIpEndpoint* UsbDevice::_findEndpoint(uint8_t address) const {
+    for (int i = 0; i < _epCount; i++)
+        if (_eps[i].address == address) return &_eps[i];
+    return nullptr;
+}
+
+int UsbDevice::_printerIfaceNum() const {
+    for (int i = 0; i < _ifaceCount; i++)
+        if (_ifaces[i].ifaceClass == USB_CLASS_PRINTER && _ifaces[i].ifaceSubClass == USB_SUBCLASS_PRINTER)
+            return _ifaces[i].ifaceNum;
+    return -1;
 }
 
 void UsbDevice::_closeDevice() {
     if (_deviceHandle) {
-        usb_host_interface_release(_clientHandle, _deviceHandle, _ifaceNum);
+        for (int i = 0; i < _ifaceCount; i++)
+            usb_host_interface_release(_clientHandle, _deviceHandle, _ifaces[i].ifaceNum);
         usb_host_device_close(_clientHandle, _deviceHandle);
         _deviceHandle = nullptr;
     }
     _state           = DEVICE_DISCONNECTED;
     _maintenanceMode = false;
     _epOut = _epIn   = 0;
+    _epOutMPS = _epInMPS = 64;
+    _ifaceCount = 0;
+    _epCount    = 0;
     _devDescLen = _cfgDescLen = 0;
     _deviceId = _manufacturer = _product = "";
     _USBIP_LOGW("USB Device closed");
 }
 
 bool UsbDevice::_getDeviceId() {
-    if (!_deviceHandle) return false;
+    int ifaceNum = _printerIfaceNum();
+    if (ifaceNum < 0 || !_deviceHandle) return false;
 
     usb_transfer_t* xfer;
     if (usb_host_transfer_alloc(264, 0, &xfer) != ESP_OK) return false;
@@ -199,7 +244,7 @@ bool UsbDevice::_getDeviceId() {
     s->bmRequestType = 0xA1;  // Class | Interface | IN
     s->bRequest      = USB_PRINTER_GET_DEVICE_ID;
     s->wValue        = 0;
-    s->wIndex        = _ifaceNum;
+    s->wIndex        = ifaceNum;
     s->wLength       = 256;
     xfer->num_bytes  = 256 + sizeof(usb_setup_packet_t);
 
@@ -223,13 +268,16 @@ bool UsbDevice::_getDeviceId() {
     return !_deviceId.isEmpty();
 }
 
-// ── Internal bulk transfer ────────────────────────────────────────────────────
+// ── Internal bulk/interrupt transfer ──────────────────────────────────────────
 
 int UsbDevice::_bulkTransfer(uint8_t endpoint, uint8_t* buffer,
                                size_t length, uint32_t timeoutMs) {
     if (!_deviceHandle || length == 0) return -1;
 
-    uint16_t mps     = (endpoint & 0x80) ? _epInMPS : _epOutMPS;
+    uint16_t mps = 64;
+    if (const UsbIpEndpoint* e = _findEndpoint(endpoint)) mps = e->maxPacketSize;
+    else if (endpoint == _epIn)  mps = _epInMPS;
+    else if (endpoint == _epOut) mps = _epOutMPS;
     size_t allocSize = ((length + mps - 1) / mps) * mps;
 
     usb_transfer_t* xfer;
@@ -380,8 +428,15 @@ int UsbDevice::submitBulkIn(uint8_t* buf, size_t maxLen, uint32_t timeoutMs) {
     return _bulkTransfer(_epIn, buf, maxLen, timeoutMs);
 }
 
+int UsbDevice::submitTransfer(uint8_t epAddr, uint8_t* buf, size_t len, uint32_t timeoutMs) {
+    if (!_deviceHandle) return -1;
+    return _bulkTransfer(epAddr, buf, len, timeoutMs);
+}
+
 bool UsbDevice::softReset() {
-    if (!_deviceHandle) return false;
+    int ifaceNum = _printerIfaceNum();
+    if (ifaceNum < 0 || !_deviceHandle) return false;
+
     usb_transfer_t* xfer;
     if (usb_host_transfer_alloc(8, 0, &xfer) != ESP_OK) return false;
 
@@ -393,7 +448,7 @@ bool UsbDevice::softReset() {
     s->bmRequestType = 0x21;  // Class | Interface | OUT
     s->bRequest      = USB_PRINTER_SOFT_RESET;
     s->wValue        = 0;
-    s->wIndex        = _ifaceNum;
+    s->wIndex        = ifaceNum;
     s->wLength       = 0;
     xfer->num_bytes  = sizeof(usb_setup_packet_t);
 
