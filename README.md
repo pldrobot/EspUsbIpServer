@@ -9,7 +9,12 @@ Handles USB Host enumeration, bulk and control transfer forwarding, and the full
 ## Hardware requirements
 
 - **ESP32-S3** with an exposed USB D+/D− pair wired for Host mode (not the UART/JTAG USB)
-- A USB device plugged into the Host port (currently auto-enumerates USB printers, class `0x07`)
+- Any Low-/Full-Speed USB device plugged into the Host port — USB printers, CDC-ACM serial
+  devices (e.g. an Arduino's onboard USB-serial chip), CH340/FTDI-style vendor-specific serial
+  adapters, HID devices, etc. Every interface (alternate setting 0) is claimed and every bulk or
+  interrupt endpoint on it is forwarded; isochronous endpoints, non-default alternate settings,
+  and High-Speed devices are out of scope (the ESP32-S3's USB-OTG peripheral has no High-Speed PHY
+  anyway, so that last one isn't a real-world limitation).
 
 ---
 
@@ -102,13 +107,16 @@ Windows clients use [usbipd-win](https://github.com/dorssel/usbipd-win).
 | `sendData(data, len)` | Bulk OUT — rejected while USB/IP holds the lock. |
 | `readData(buf, maxLen, timeout)` | Bulk IN. |
 | `sendMaintCommand(cmd, len, resp, respLen, timeout)` | Send a command and optionally read back a response. |
-| `softReset()` | Send USB printer soft-reset control request. |
+| `softReset()` | Send a USB-printer soft-reset control request — a no-op (returns `false`) unless a printer-class (`0x07`/`0x01`) interface was actually claimed. |
 | `setMaintenanceMode(bool)` | Acquire/release the exclusive USB/IP lock (managed automatically by `UsbIpServer`). |
 | `getVendorId()` / `getProductId()` | USB VID/PID of the connected device. |
+| `getSpeed()` | The device's real negotiated speed (`USB_SPEED_LOW`/`USB_SPEED_FULL`). |
+| `getIfaceCount()` / `getIfaceDesc(i, out[4])` | Every interface actually claimed on the device, with its real class/subclass/protocol. |
 | `getDevDescRaw()` / `getCfgDescRaw()` | Raw descriptor bytes forwarded to the USB/IP client. |
 | `submitControlTransfer(setup, data, len, timeout)` | Generic control transfer (used by `UsbIpServer`). |
-| `submitBulkOut(data, len, timeout)` | Generic bulk OUT (used by `UsbIpServer`). |
-| `submitBulkIn(buf, maxLen, timeout)` | Generic bulk IN (used by `UsbIpServer`). |
+| `submitBulkOut(data, len, timeout)` | Bulk OUT on the device's first bulk-OUT endpoint — kept for `sendData()`/`sendMaintCommand()`. |
+| `submitBulkIn(buf, maxLen, timeout)` | Bulk IN on the device's first bulk-IN endpoint — kept for `readData()`. |
+| `submitTransfer(epAddr, buf, len, timeout)` | Generic bulk/interrupt transfer to *any* claimed endpoint, addressed by its real `bEndpointAddress` (used by `UsbIpServer` to route each URB to the right pipe on multi-endpoint devices). |
 
 ### `UsbIpServer`
 
@@ -151,6 +159,14 @@ Set before including the header:
 - **Single session**: a new incoming connection automatically kicks the existing client.
 - **Maintenance lock**: `UsbIpServer` acquires `setMaintenanceMode(true)` on attach and releases it on disconnect, blocking normal `sendData()` calls while a remote client is active.
 - **SET_CONFIGURATION / SET_INTERFACE** control requests are intercepted and acknowledged locally — the device is already configured by the ESP-IDF USB Host driver.
+- **Generic enumeration**: every interface at alternate setting 0 is claimed, and every bulk or
+  interrupt endpoint on it is recorded; `UsbIpServer` forwards each incoming URB to the exact
+  endpoint address it names, so multi-interface/multi-endpoint composite devices (e.g. a CDC-ACM
+  serial device with separate Communications + Data interfaces) work the same way a single-pipe
+  device like a printer does. Isochronous endpoints and non-default alternate settings are skipped.
+- **Real device descriptors**: `OP_REQ_DEVLIST`/`OP_REQ_IMPORT` report the device's actual negotiated
+  speed, interface count, and per-interface class/subclass/protocol — not a fixed printer tuple —
+  so the USB/IP client's own native driver (CDC-ACM, CH341, FTDI, usblp, ...) binds correctly.
 
 ---
 

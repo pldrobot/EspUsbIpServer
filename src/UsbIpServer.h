@@ -20,6 +20,8 @@ using UsbIpDisconnectCallback = std::function<void(const char* clientIP, uint32_
 #define USBIP_RET_UNLINK  0x00000004
 #define USBIP_DIR_OUT     0
 #define USBIP_DIR_IN      1
+#define USBIP_SPEED_LOW   1
+#define USBIP_SPEED_FULL  2
 #define USBIP_SPEED_HIGH  3
 #define USBIP_BUSNUM      1
 #define USBIP_DEVNUM      2

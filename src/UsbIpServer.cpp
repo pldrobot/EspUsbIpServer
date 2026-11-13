@@ -50,12 +50,16 @@ void UsbIpServer::_fillDevInfo(uint8_t out[312]) {
     strncpy((char*)(out + 256), USBIP_BUSID, 31);
     _w32(out + 288, USBIP_BUSNUM);
     _w32(out + 292, USBIP_DEVNUM);
-    _w32(out + 296, USBIP_SPEED_HIGH);
+    // The ESP32-S3's USB-OTG peripheral has no High-Speed PHY — report the
+    // device's real negotiated speed (Low or Full), not a hardcoded value.
+    uint32_t speed = (_device->getSpeed() == USB_SPEED_LOW) ? USBIP_SPEED_LOW : USBIP_SPEED_FULL;
+    _w32(out + 296, speed);
     _w16(out + 300, _device->getVendorId());
     _w16(out + 302, _device->getProductId());
     _w16(out + 304, 0x0100);
     out[306] = 0; out[307] = 0; out[308] = 0;
-    out[309] = 1; out[310] = 1; out[311] = 1;
+    out[309] = 1; out[310] = 1;
+    out[311] = (uint8_t)_device->getIfaceCount();
 }
 
 // ── Session tracking ──────────────────────────────────────────────────────────
@@ -218,9 +222,15 @@ bool UsbIpServer::_handleDevList() {
     if (has) {
         uint8_t devinfo[312]; _fillDevInfo(devinfo);
         if (!_writeAll(devinfo, 312)) return false;
-        // Interface descriptor: class=0x07 (printer), subclass=0x01, protocol=0x02, reserved=0x00
-        uint8_t iface[4] = { 0x07, 0x01, 0x02, 0x00 };
-        _writeAll(iface, 4);
+        // One interface-descriptor entry per claimed interface, sourced from
+        // the real device (printer, CDC-ACM composite, vendor-specific, ...)
+        // instead of a fixed printer-class tuple.
+        int n = _device->getIfaceCount();
+        for (int i = 0; i < n; i++) {
+            uint8_t iface[4];
+            if (!_device->getIfaceDesc(i, iface)) break;
+            if (!_writeAll(iface, 4)) return false;
+        }
     }
     return true;
 }
@@ -288,14 +298,21 @@ bool UsbIpServer::_processSubmit(uint32_t seqnum, uint32_t direction, uint32_t e
         usb_setup_packet_t pkt; memcpy(&pkt, setup, 8);
         actual = _device->submitControlTransfer(&pkt, buf, bufLen, 3000);
         if (actual < 0) { status = -32; actual = 0; }
-    } else if (direction == USBIP_DIR_OUT) {
-        if (bufLen > 0 && !_readExact(buf, bufLen)) { free(buf); return false; }
-        actual = _device->submitBulkOut(buf, bufLen, 8000);
-        if (actual < 0) { status = -32; actual = 0; }
     } else {
-        if (bufLen > 0) {
-            actual = _device->submitBulkIn(buf, bufLen, 5000);
+        // Build the real endpoint address from the URB's endpoint number +
+        // direction, and forward to it directly — works for any claimed
+        // bulk/interrupt endpoint on any interface, not just a single
+        // remembered pair.
+        uint8_t epAddr = (uint8_t)ep | (direction == USBIP_DIR_IN ? 0x80 : 0x00);
+        if (direction == USBIP_DIR_OUT) {
+            if (bufLen > 0 && !_readExact(buf, bufLen)) { free(buf); return false; }
+            actual = _device->submitTransfer(epAddr, buf, bufLen, 8000);
             if (actual < 0) { status = -32; actual = 0; }
+        } else {
+            if (bufLen > 0) {
+                actual = _device->submitTransfer(epAddr, buf, bufLen, 5000);
+                if (actual < 0) { status = -32; actual = 0; }
+            }
         }
     }
 
