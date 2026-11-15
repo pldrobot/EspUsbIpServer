@@ -72,6 +72,7 @@ void UsbDevice::_handleClientEvent(const usb_host_client_event_msg_t* msg) {
         if (_state == DEVICE_DISCONNECTED)
             _openDevice(msg->new_dev.address);
     } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        if (msg->dev_gone.dev_hdl != _deviceHandle) return;   // not the device we hold
         _USBIP_LOGW("USB Device disconnected");
         _closeDevice();
     }
@@ -153,9 +154,16 @@ bool UsbDevice::_enumerateInterfaces() {
                                 iface->bInterfaceSubClass, iface->bInterfaceProtocol);
 
                     int epOff = offset + desc->bLength;
-                    for (int i = 0; i < iface->bNumEndpoints && epOff < total; i++) {
+                    // Class-specific descriptors (HID, CDC functional, ...) sit between the
+                    // interface and its endpoints, so scan until the next interface and count
+                    // only real endpoint descriptors.
+                    int epSeen = 0;
+                    while (epOff < total && epSeen < iface->bNumEndpoints) {
                         const usb_standard_desc_t* raw = (const usb_standard_desc_t*)(p + epOff);
+                        if (raw->bLength == 0) break;
+                        if (raw->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) break;
                         if (raw->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+                            epSeen++;
                             const usb_ep_desc_t* ep = (const usb_ep_desc_t*)raw;
                             usb_transfer_type_t xtype = USB_EP_DESC_GET_XFERTYPE(ep);
                             if (xtype == USB_TRANSFER_TYPE_ISOCHRONOUS)
