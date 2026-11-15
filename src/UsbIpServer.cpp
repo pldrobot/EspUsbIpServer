@@ -127,6 +127,19 @@ void UsbIpServer::_acceptLoop() {
                  (unsigned)(ipv >> 24), (unsigned)((ipv >> 16) & 255),
                  (unsigned)((ipv >> 8) & 255), (unsigned)(ipv & 255));
 
+        // A new connection must not be refused just because an earlier one has not attached the
+        // device yet (a device-list request still being torn down, or one that never imports).
+        // Drop that idle session and take over; only an attached device makes us busy.
+        LOCK();
+        const bool preempt = _sessionActive && !_attached && _enabled;
+        UNLOCK();
+        if (preempt) {
+            _USBIP_LOGD("Dropping unattached session from %s for a new connection", _curIP);
+            _kickReq = true;
+            _shutdownFd();
+            for (int i = 0; i < 200 && _sessionActive; i++) vTaskDelay(pdMS_TO_TICKS(5));   // up to 1 s
+        }
+
         LOCK();
         bool busy = _sessionActive || !_enabled;
         if (!busy) {
