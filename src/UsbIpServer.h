@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <functional>
+#include "usb/usb_host.h"
 
 class UsbDevice;
 
@@ -77,6 +78,71 @@ private:
     static const int MAX_HISTORY = 6;
     UsbIpSessionRecord _history[MAX_HISTORY];
     int                _histNext = 0;
+
+    // IN URBs (bulk/interrupt reads) are submitted asynchronously and answered
+    // when the device completes them, so a read that waits for data (an idle
+    // serial port, an interrupt endpoint) never blocks later URBs - such as the
+    // OUT write that makes the device produce that data.
+    struct PendingUrb {
+        bool            used      = false;
+        volatile bool   done      = false;
+        bool            cancelled = false;
+        uint32_t        seqnum    = 0;
+        uint32_t        order     = 0;     // submission order (replies must keep it)
+        uint8_t         epAddr    = 0;
+        int32_t         bufLen    = 0;
+        usb_transfer_t* xfer      = nullptr;
+        // Read-ahead URBs (bulk IN) are not backed by a USB transfer: they are filled
+        // from the endpoint's receive ring in _rxService().
+        bool            ring      = false;
+        uint8_t*        buf       = nullptr;
+        int32_t         got       = 0;
+    };
+    static const int MAX_PENDING = 32;
+    PendingUrb _pending[MAX_PENDING];
+    uint32_t   _pendingSeq = 0;
+
+    // Bulk IN read-ahead. The ESP keeps each bulk IN endpoint armed with small
+    // single-packet transfers at all times and stores what arrives in a ring, instead of
+    // reading only while the client has a URB outstanding. A real host controller polls
+    // continuously; reading only on demand (with a network round trip between reads)
+    // lets a streaming device overflow its tiny FIFO - a CH340 at 115200 baud loses data
+    // in gaps of a few milliseconds. Packet boundaries are kept so client URBs complete
+    // exactly as on real hardware: on a full buffer or on a short/zero-length packet.
+    static const int RX_PKT_MAX  = 64;      // largest full-speed bulk packet
+    static const int RX_RING     = 128;     // packets buffered per endpoint
+    static const int RX_ARMS     = 12;      // transfers kept queued on the device
+    static const int RX_CARRY    = 4096;    // bytes handed back by an unlinked, part-filled URB
+    static const int RX_URB_MAX  = 4096;    // largest read buffer per client URB
+    static const int MAX_RX_EPS  = 2;
+    struct RxPkt { uint8_t len; uint8_t off; uint8_t data[RX_PKT_MAX]; };
+    struct RxArm { usb_transfer_t* xfer = nullptr; volatile bool done = false; };
+    struct RxEp {
+        bool      active  = false;
+        uint8_t   addr    = 0;
+        uint16_t  mps     = 0;
+        RxPkt*    ring    = nullptr;
+        int       head    = 0, count = 0;
+        uint8_t*  carry   = nullptr;
+        int       carryLen = 0;
+        RxArm     arm[RX_ARMS];
+        int       armed   = 0;
+        unsigned long retryAt = 0;
+    };
+    RxEp _rx[MAX_RX_EPS];
+
+    static void _rxDone(usb_transfer_t* t);
+    RxEp* _rxFind(uint8_t addr);
+    void  _rxStart();
+    void  _rxStop();
+    void  _rxArm(RxEp& r);
+    void  _rxPump();
+    void  _rxService();
+
+    static void _urbDone(usb_transfer_t* t);
+    void _drainPending();
+    void _cancelAllPending();
+    void _handleUnlink(uint32_t seqnum, uint32_t victim);
 
     static void _serverTask(void* arg);
     void        _poll();

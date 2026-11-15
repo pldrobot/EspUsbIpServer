@@ -98,6 +98,9 @@ bool UsbDevice::_openDevice(uint8_t devAddr) {
 
     const usb_config_desc_t* cfgDesc;
     if (usb_host_get_active_config_descriptor(_deviceHandle, &cfgDesc) == ESP_OK) {
+        if (cfgDesc->wTotalLength > CFG_DESC_BUF_SIZE)
+            _USBIP_LOGW("USB configuration descriptor is %u bytes, stored copy truncated to %d",
+                        cfgDesc->wTotalLength, CFG_DESC_BUF_SIZE);
         _cfgDescLen = min((uint16_t)CFG_DESC_BUF_SIZE, cfgDesc->wTotalLength);
         memcpy(_cfgDescBuf, cfgDesc, _cfgDescLen);
     }
@@ -155,6 +158,9 @@ bool UsbDevice::_enumerateInterfaces() {
                         if (raw->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
                             const usb_ep_desc_t* ep = (const usb_ep_desc_t*)raw;
                             usb_transfer_type_t xtype = USB_EP_DESC_GET_XFERTYPE(ep);
+                            if (xtype == USB_TRANSFER_TYPE_ISOCHRONOUS)
+                                _USBIP_LOGW("USB iso ep=0x%02X skipped (isochronous not supported)",
+                                            ep->bEndpointAddress);
                             if ((xtype == USB_TRANSFER_TYPE_BULK || xtype == USB_TRANSFER_TYPE_INTR) &&
                                 _epCount < USBIP_MAX_EPS) {
                                 _eps[_epCount++] = { ep->bEndpointAddress, (uint8_t)xtype,
@@ -213,9 +219,23 @@ int UsbDevice::_printerIfaceNum() const {
 
 void UsbDevice::_closeDevice() {
     if (_deviceHandle) {
-        for (int i = 0; i < _ifaceCount; i++)
-            usb_host_interface_release(_clientHandle, _deviceHandle, _ifaces[i].ifaceNum);
-        usb_host_device_close(_clientHandle, _deviceHandle);
+        // On unplug the stack completes every queued transfer with NO_DEVICE, but only
+        // while events are being processed. Releasing an interface or closing the device
+        // fails until then, so pump events and retry for a bounded time.
+        for (int i = 0; i < _ifaceCount; i++) {
+            for (int t = 0; t < 100; t++) {
+                if (usb_host_interface_release(_clientHandle, _deviceHandle,
+                                               _ifaces[i].ifaceNum) != ESP_ERR_INVALID_STATE) break;
+                usb_host_client_handle_events(_clientHandle, 10);
+            }
+        }
+        esp_err_t err = ESP_FAIL;
+        for (int t = 0; t < 100; t++) {
+            err = usb_host_device_close(_clientHandle, _deviceHandle);
+            if (err != ESP_ERR_INVALID_STATE) break;
+            usb_host_client_handle_events(_clientHandle, 10);
+        }
+        if (err != ESP_OK) _USBIP_LOGW("USB device close: %s", esp_err_to_name(err));
         _deviceHandle = nullptr;
     }
     _state           = DEVICE_DISCONNECTED;
@@ -431,6 +451,60 @@ int UsbDevice::submitBulkIn(uint8_t* buf, size_t maxLen, uint32_t timeoutMs) {
 int UsbDevice::submitTransfer(uint8_t epAddr, uint8_t* buf, size_t len, uint32_t timeoutMs) {
     if (!_deviceHandle) return -1;
     return _bulkTransfer(epAddr, buf, len, timeoutMs);
+}
+
+usb_transfer_t* UsbDevice::beginInTransfer(uint8_t epAddr, size_t len,
+                                           usb_transfer_cb_t cb, void* ctx) {
+    if (!_deviceHandle || len == 0 || !(epAddr & 0x80)) return nullptr;
+
+    uint16_t mps = 64;
+    if (const UsbIpEndpoint* e = _findEndpoint(epAddr)) {
+        mps = e->maxPacketSize;
+        // An interrupt transfer is one packet. A request longer than the endpoint's packet
+        // size only completes on a short packet, so a device that sends exactly-MPS reports
+        // (an 8-byte HID keyboard report on a low-speed device) would sit unreported until
+        // the whole buffer filled. Asking for one packet returns each report promptly; a
+        // short read is always valid.
+        if (e->type == USB_TRANSFER_TYPE_INTR && mps > 0 && len > mps) len = mps;
+    }
+    if (mps == 0) mps = 64;
+    // The stack needs an IN length that is a multiple of MPS. Round DOWN (at least one
+    // packet): the device can then never send more than the client asked for, so no
+    // bytes are ever dropped - a short read is always valid, silently truncating is not.
+    size_t allocSize = (len / mps) * mps;
+    if (allocSize == 0) allocSize = mps;
+
+    usb_transfer_t* xfer;
+    if (usb_host_transfer_alloc(allocSize, 0, &xfer) != ESP_OK) return nullptr;
+
+    xfer->device_handle    = _deviceHandle;
+    xfer->bEndpointAddress = epAddr;
+    xfer->num_bytes        = allocSize;
+    xfer->timeout_ms       = 0;
+    xfer->callback         = cb;
+    xfer->context          = ctx;
+
+    esp_err_t err = usb_host_transfer_submit(xfer);
+    if (err != ESP_OK) {
+        _USBIP_LOGW("USB IN submit ep 0x%02X failed: %s", epAddr, esp_err_to_name(err));
+        usb_host_transfer_free(xfer);
+        return nullptr;
+    }
+    return xfer;
+}
+
+void UsbDevice::cancelEndpoint(uint8_t epAddr) {
+    if (!_deviceHandle) return;
+    usb_host_endpoint_halt(_deviceHandle, epAddr);
+    usb_host_endpoint_flush(_deviceHandle, epAddr);
+}
+
+void UsbDevice::clearEndpoint(uint8_t epAddr) {
+    if (_deviceHandle) usb_host_endpoint_clear(_deviceHandle, epAddr);
+}
+
+void UsbDevice::freeTransfer(usb_transfer_t* xfer) {
+    if (xfer) usb_host_transfer_free(xfer);
 }
 
 bool UsbDevice::softReset() {

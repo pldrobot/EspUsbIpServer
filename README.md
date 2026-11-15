@@ -14,7 +14,8 @@ Handles USB Host enumeration, bulk and control transfer forwarding, and the full
   adapters, HID devices, etc. Every interface (alternate setting 0) is claimed and every bulk or
   interrupt endpoint on it is forwarded; isochronous endpoints, non-default alternate settings,
   and High-Speed devices are out of scope (the ESP32-S3's USB-OTG peripheral has no High-Speed PHY
-  anyway, so that last one isn't a real-world limitation).
+  anyway, so that last one isn't a real-world limitation). One device at a time: hubs are not
+  supported, and a second device is ignored while the first is plugged in.
 
 ---
 

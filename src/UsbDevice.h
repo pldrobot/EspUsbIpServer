@@ -92,6 +92,18 @@ public:
     // device instead of assuming a single remembered pair.
     int submitTransfer(uint8_t epAddr, uint8_t* buf, size_t len, uint32_t timeoutMs = 5000);
 
+    // Non-blocking IN transfer: queues a read of up to `len` bytes on `epAddr`
+    // and returns immediately; `cb` runs (from the USB host task) when it
+    // completes, is cancelled, or the device goes away. The caller owns the
+    // returned transfer until it calls freeTransfer(). Returns nullptr on
+    // failure. This lets a pending interrupt/bulk IN URB sit open without
+    // stalling the rest of the USB/IP stream.
+    usb_transfer_t* beginInTransfer(uint8_t epAddr, size_t len,
+                                    usb_transfer_cb_t cb, void* ctx);
+    void cancelEndpoint(uint8_t epAddr);   // halt + flush: pending transfers complete as CANCELED
+    void clearEndpoint(uint8_t epAddr);    // un-halt after a cancel has completed
+    void freeTransfer(usb_transfer_t* xfer);
+
     // State
     UsbDeviceState getState()   const { return _state; }
     bool isConnected() const { return _state >= DEVICE_CONNECTED; }
@@ -112,6 +124,14 @@ public:
     // Every interface actually claimed on the current device (not just one) —
     // used by UsbIpServer to report real descriptors instead of a fixed tuple.
     int  getIfaceCount() const { return _ifaceCount; }
+
+    // The bulk/interrupt endpoints claimed on the current device.
+    int  getEndpointCount() const { return _epCount; }
+    bool getEndpointInfo(int i, uint8_t& addr, uint8_t& type, uint16_t& mps) const {
+        if (i < 0 || i >= _epCount) return false;
+        addr = _eps[i].address; type = _eps[i].type; mps = _eps[i].maxPacketSize & 0x7FF;
+        return true;
+    }
     bool getIfaceDesc(int i, uint8_t out[4]) const;
 
     // Raw descriptor bytes forwarded to the USB/IP client during import

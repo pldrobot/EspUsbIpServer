@@ -44,3 +44,28 @@ inline void _usbipLog(char level, const char* fmt, ...) {
 #else
 #define _USBIP_LOGE(...) ((void)0)
 #endif
+
+// Optional URB tracing for diagnosing a device that will not talk: define
+// USBIP_TRACE=1 (e.g. -DUSBIP_TRACE=1). Logs the first USBIP_TRACE_MAX
+// forwarded URBs - control setup packets and the leading bytes of every
+// transfer - then goes quiet so it cannot flood the log.
+#ifndef USBIP_TRACE
+#define USBIP_TRACE 0
+#endif
+#ifndef USBIP_TRACE_MAX
+#define USBIP_TRACE_MAX 300
+#endif
+#if USBIP_TRACE
+inline void _usbipTrace(const char* what, uint8_t ep, int len, const uint8_t* d, int status) {
+    static int n = 0;
+    if (n >= USBIP_TRACE_MAX) return;
+    if (++n == USBIP_TRACE_MAX) { _usbipLog('W', "trace limit reached, tracing stopped"); return; }
+    char hex[40] = {0};
+    int show = (d && len > 0) ? (len < 12 ? len : 12) : 0;
+    for (int i = 0; i < show; i++) snprintf(hex + i * 3, sizeof(hex) - i * 3, "%02X ", d[i]);
+    _usbipLog('I', "T %s ep=%02X len=%d st=%d %s", what, ep, len, status, hex);
+}
+#define _USBIP_TRACE(...) _usbipTrace(__VA_ARGS__)
+#else
+#define _USBIP_TRACE(...) ((void)0)
+#endif
