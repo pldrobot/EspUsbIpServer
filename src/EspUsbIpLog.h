@@ -1,7 +1,8 @@
 #pragma once
 // Internal logging macros — not part of the public API.
 // Set USBIP_LOG_LEVEL before including esp_usbip_server.h to control verbosity:
-//   0 = silent, 1 = errors only, 2 = errors + warnings, 3 = all (default)
+//   0 = silent, 1 = errors only, 2 = errors + warnings, 3 = lifecycle info (default),
+//   4 = debug (enumeration detail, endpoints, host events)
 //
 // Optional: the application may define
 //     extern "C" void espusbip_log_hook(char level, const char* line);
@@ -31,6 +32,12 @@ inline void _usbipLog(char level, const char* fmt, ...) {
 #define _USBIP_LOGI(fmt, ...) _usbipLog('I', fmt, ##__VA_ARGS__)
 #else
 #define _USBIP_LOGI(...) ((void)0)
+#endif
+
+#if USBIP_LOG_LEVEL >= 4
+#define _USBIP_LOGD(fmt, ...) _usbipLog('D', fmt, ##__VA_ARGS__)
+#else
+#define _USBIP_LOGD(...) ((void)0)
 #endif
 
 #if USBIP_LOG_LEVEL >= 2
