@@ -261,7 +261,7 @@ void UsbIpServer::_runSession() {
     _connectedMs = millis();
     _attachedMs  = 0;
     UNLOCK();
-    _USBIP_LOGI("Connected: %s", _curIP);
+    _USBIP_LOGD("Connection from %s", _curIP);
 
     if (_handshake()) {
         _onAttach();
@@ -297,17 +297,24 @@ void UsbIpServer::_onAttach() {
 void UsbIpServer::_onDisconnect() {
     if (!_curIP[0]) return;
 
-    UsbIpSessionRecord& r = _history[_histNext];
-    r.valid       = true;
-    strncpy(r.ip, _curIP, sizeof(r.ip) - 1);
-    r.endedAt     = (uint32_t)(millis() / 1000);
-    r.durationSec = _attachedMs ? (uint32_t)((millis() - _attachedMs) / 1000) : 0;
-    _histNext = (_histNext + 1) % MAX_HISTORY;
+    // Only a session that attached the device is a session worth reporting. A connection that
+    // just asked for the device list (every scan of a client does) must not add a history entry
+    // or fire the disconnect callback: applications typically save state in it.
+    if (_attached) {
+        UsbIpSessionRecord& r = _history[_histNext];
+        r.valid       = true;
+        strncpy(r.ip, _curIP, sizeof(r.ip) - 1);
+        r.endedAt     = (uint32_t)(millis() / 1000);
+        r.durationSec = _attachedMs ? (uint32_t)((millis() - _attachedMs) / 1000) : 0;
+        _histNext = (_histNext + 1) % MAX_HISTORY;
 
-    _USBIP_LOGI("Disconnected: %s (attached %us)", _curIP, r.durationSec);
-    if (_attached) _device->setMaintenanceMode(false);
-    _attached = false;
-    if (_onDisconnectCb) _onDisconnectCb(r.ip, r.durationSec);
+        _USBIP_LOGI("Disconnected: %s (attached %us)", _curIP, r.durationSec);
+        _device->setMaintenanceMode(false);
+        _attached = false;
+        if (_onDisconnectCb) _onDisconnectCb(r.ip, r.durationSec);
+    } else {
+        _USBIP_LOGD("Connection from %s closed without attaching", _curIP);
+    }
     memset(_curIP, 0, sizeof(_curIP));
     _connectedMs = 0;
     _attachedMs  = 0;
