@@ -1,19 +1,12 @@
 #pragma once
 #include <Arduino.h>
+#include <atomic>
+#include <functional>
 #include "usb/usb_host.h"
+#include "freertos/semphr.h"
+#include "UsbIpConfig.h"
 
-#define USB_CLASS_PRINTER       0x07
-#define USB_SUBCLASS_PRINTER    0x01
-#define USB_PROTOCOL_UNIDIR     0x01
-#define USB_PROTOCOL_BIDIR      0x02
-#define USB_PROTOCOL_1284       0x03
-
-#define USB_PRINTER_GET_DEVICE_ID   0x00
-#define USB_PRINTER_GET_PORT_STATUS 0x01
-#define USB_PRINTER_SOFT_RESET      0x02
-
-// USB standard request codes (intercepted by USB/IP forwarding layer)
-#define USB_REQ_SET_ADDRESS       0x05
+// USB standard request codes handled by the USB/IP layer instead of being forwarded
 #define USB_REQ_SET_CONFIGURATION 0x09
 #define USB_REQ_SET_INTERFACE     0x0B
 
@@ -21,20 +14,8 @@ enum UsbDeviceState {
     DEVICE_DISCONNECTED,
     DEVICE_CONNECTED,
     DEVICE_READY,
-    DEVICE_BUSY,
-    DEVICE_MAINTENANCE,   // Locked for USB/IP exclusive access
-    DEVICE_ERROR
+    DEVICE_MAINTENANCE    // a USB/IP client holds the device
 };
-
-#define DEV_DESC_BUF_SIZE   18
-#define CFG_DESC_BUF_SIZE   512
-
-// Generic enumeration tables — this library claims and forwards *any* bulk or
-// interrupt endpoint on *any* interface (alternate setting 0 only), not just
-// a USB-printer interface. Isochronous endpoints and non-default alternate
-// settings are out of scope (see README).
-#define USBIP_MAX_IFACES  8
-#define USBIP_MAX_EPS     16
 
 struct UsbIpIface {
     uint8_t ifaceNum;
@@ -47,92 +28,75 @@ struct UsbIpEndpoint {
     uint8_t  address;        // bEndpointAddress, direction bit included
     uint8_t  type;           // usb_transfer_type_t: BULK or INTR
     uint16_t maxPacketSize;
-    uint8_t  interval;       // bInterval (informational, interrupt endpoints)
+    uint8_t  interval;
+    uint8_t  ifaceClass;     // class of the interface that owns the endpoint
 };
 
+// USB host side: owns the host library, the client, and the one attached device.
+//
+// Threads: one `usb_host` task pumps the host library and the client. Transfer
+// completion callbacks and device events all run on it. A device that went
+// away is closed from that same task, in small steps between event batches, because
+// the host stack only releases it once every queued transfer has been completed
+// (by callbacks on this very task).
+//
+// Generic by design: any single full/low-speed device is exported. Every interface
+// (alternate setting 0) is claimed; every bulk and interrupt endpoint is forwarded.
+// Isochronous endpoints, alternate settings > 0, hubs and high speed are out of scope.
 class UsbDevice {
 public:
+    using GoneCallback = std::function<void()>;
+
     UsbDevice();
 
-    // Install USB Host driver and spawn the event task on the opposite core.
+    // Install the USB host and start its tasks. Safe to call once.
     bool begin();
+    // Close the device, stop the tasks and uninstall the host.
+    void end();
 
-    // Suspend / resume the USB Host event task.
+    // Suspend / resume the host tasks.
     void stop();
     void start();
 
-    // Normal data path — rejected while USB/IP holds the maintenance lock.
-    // Uses the device's first bulk OUT/IN endpoint pair (set during
-    // enumeration); for multi-endpoint devices, use submitTransfer() instead.
-    int sendData(const uint8_t* data, size_t length);
-    int readData(uint8_t* buffer, size_t maxLength, uint32_t timeoutMs = 2000);
-
-    // Maintenance/diagnostic path
-    int  sendMaintCommand(const uint8_t* cmd, size_t cmdLen,
-                          uint8_t* response = nullptr,
-                          size_t   responseMaxLen = 0,
-                          uint32_t responseTimeoutMs = 2000);
-    // USB-printer SOFT_RESET — no-op (returns false) unless a printer-class
-    // interface (0x07/0x01) is actually present among the claimed interfaces.
-    bool softReset();
-
-    // Exclusive lock held by the USB/IP server while a client is attached
+    // Exclusive lock held by the USB/IP server while a client is attached.
     void setMaintenanceMode(bool active);
     bool isInMaintenanceMode() const { return _maintenanceMode; }
 
-    // Generic transfers used by UsbIpServer to forward URBs
-    int submitControlTransfer(usb_setup_packet_t* setup,
-                              uint8_t* data, size_t dataLen,
-                              uint32_t timeoutMs = 3000);
-    int submitBulkOut(const uint8_t* data, size_t len, uint32_t timeoutMs = 5000);
-    int submitBulkIn(uint8_t*  buf,  size_t maxLen,    uint32_t timeoutMs = 3000);
-    // Generic bulk/interrupt transfer to any claimed endpoint, addressed by
-    // its real bEndpointAddress (direction bit included) — this is what lets
-    // UsbIpServer forward a URB to the correct pipe on a multi-endpoint
-    // device instead of assuming a single remembered pair.
-    int submitTransfer(uint8_t epAddr, uint8_t* buf, size_t len, uint32_t timeoutMs = 5000);
+    // Called from the usb_host task the moment the device is unplugged.
+    void onDeviceGone(GoneCallback cb) { _goneCb = cb; }
 
-    // Non-blocking IN transfer: queues a read of up to `len` bytes on `epAddr`
-    // and returns immediately; `cb` runs (from the USB host task) when it
-    // completes, is cancelled, or the device goes away. The caller owns the
-    // returned transfer until it calls freeTransfer(). Returns nullptr on
-    // failure. This lets a pending interrupt/bulk IN URB sit open without
-    // stalling the rest of the USB/IP stream.
-    usb_transfer_t* beginInTransfer(uint8_t epAddr, size_t len,
-                                    usb_transfer_cb_t cb, void* ctx);
-    void cancelEndpoint(uint8_t epAddr);   // halt + flush: pending transfers complete as CANCELED
-    void clearEndpoint(uint8_t epAddr);    // un-halt after a cancel has completed
-    void freeTransfer(usb_transfer_t* xfer);
+    // ── Transfers (used by UsbIpServer) ──────────────────────────────────────
+    // `xfer` is owned by the caller; its callback runs on the usb_host task. Both fail
+    // with ESP_ERR_INVALID_STATE when no device is present.
+    esp_err_t submitTransfer(usb_transfer_t* xfer);   // bulk / interrupt
+    esp_err_t submitControl(usb_transfer_t* xfer);    // control (setup packet in data_buffer)
+    void cancelEndpoint(uint8_t epAddr);              // halt + flush: queued transfers complete as CANCELED
+    void clearEndpoint(uint8_t epAddr);               // un-halt once every transfer has completed
 
-    // State
-    UsbDeviceState getState()   const { return _state; }
+    // ── State ────────────────────────────────────────────────────────────────
+    UsbDeviceState getState() const { return _state; }
     bool isConnected() const { return _state >= DEVICE_CONNECTED; }
     bool isReady()     const { return _state == DEVICE_READY; }
-    bool isBusy()      const { return _state == DEVICE_BUSY; }
 
-    // Identity
+    // ── Identity ─────────────────────────────────────────────────────────────
     String   getManufacturer() const { return _manufacturer; }
     String   getProduct()      const { return _product; }
-    String   getDeviceId()     const { return _deviceId; }
+    String   getSerial()       const { return _serial; }
     uint16_t getVendorId()     const { return _vendorId; }
     uint16_t getProductId()    const { return _productId; }
-    uint8_t  getEpOut()        const { return _epOut; }
-    uint8_t  getEpIn()         const { return _epIn; }
-    uint8_t  getIfaceNum()     const { return _ifaceCount ? _ifaces[0].ifaceNum : 0; }
+    uint8_t  getDevAddr()      const { return _devAddr; }
     usb_speed_t getSpeed()     const { return _speed; }
 
-    // Every interface actually claimed on the current device (not just one) —
-    // used by UsbIpServer to report real descriptors instead of a fixed tuple.
     int  getIfaceCount() const { return _ifaceCount; }
+    bool getIfaceDesc(int i, uint8_t out[4]) const;
 
-    // The bulk/interrupt endpoints claimed on the current device.
     int  getEndpointCount() const { return _epCount; }
+    const UsbIpEndpoint* findEndpoint(uint8_t address) const;
     bool getEndpointInfo(int i, uint8_t& addr, uint8_t& type, uint16_t& mps) const {
         if (i < 0 || i >= _epCount) return false;
         addr = _eps[i].address; type = _eps[i].type; mps = _eps[i].maxPacketSize & 0x7FF;
         return true;
     }
-    bool getIfaceDesc(int i, uint8_t out[4]) const;
 
     // Raw descriptor bytes forwarded to the USB/IP client during import
     const uint8_t* getDevDescRaw() const { return _devDescBuf; }
@@ -141,21 +105,25 @@ public:
     size_t         getCfgDescLen() const { return _cfgDescLen; }
 
 private:
-    UsbDeviceState _state;
-    bool _maintenanceMode;
+    std::atomic<UsbDeviceState> _state;
+    volatile bool _maintenanceMode;
 
-    String   _manufacturer, _product, _deviceId;
+    String   _manufacturer, _product, _serial;
     uint16_t _vendorId, _productId;
+    uint8_t  _devAddr;
 
-    TaskHandle_t             _taskHandle;
+    TaskHandle_t             _hostTask;
     usb_host_client_handle_t _clientHandle;
-    usb_device_handle_t      _deviceHandle;
+    usb_device_handle_t      _deviceHandle;     // guarded by _devMtx
+    SemaphoreHandle_t        _devMtx;
 
-    // "Primary" bulk pair — the first bulk IN/OUT endpoints found during
-    // enumeration — kept for sendData()/readData()/sendMaintCommand(), which
-    // predate (and don't need) the full generic endpoint table below.
-    uint8_t  _epOut, _epIn;
-    uint16_t _epOutMPS, _epInMPS;
+    // Device-close state machine (runs on usb_host).
+    volatile bool _everSeen = false;   // a NEW_DEV event has arrived since begin()
+    volatile bool _gone;           // device unplugged or unusable: no more submits
+    volatile bool _closeReq;
+    uint32_t      _closeStartMs;
+    int           _relIdx;         // next interface to release
+    int           _pendingAddr;    // NEW_DEV that arrived while still closing, or -1
 
     usb_speed_t _speed;
 
@@ -164,23 +132,21 @@ private:
     UsbIpEndpoint _eps[USBIP_MAX_EPS];
     int           _epCount;
 
-    uint8_t _devDescBuf[DEV_DESC_BUF_SIZE];
+    uint8_t _devDescBuf[USBIP_DEV_DESC_SIZE];
     size_t  _devDescLen;
-    uint8_t _cfgDescBuf[CFG_DESC_BUF_SIZE];
+    uint8_t _cfgDescBuf[USBIP_CFG_DESC_SIZE];
     size_t  _cfgDescLen;
 
-    static void _deviceTask(void* arg);
-    void        _poll();
+    GoneCallback _goneCb;
 
+    static void _hostTaskFn(void* arg);
     static void _clientEventCallback(const usb_host_client_event_msg_t*, void*);
     void _handleClientEvent(const usb_host_client_event_msg_t*);
+
     bool _openDevice(uint8_t devAddr);
+    void _adoptExistingDevice();   // open a device the host enumerated before we could see its NEW_DEV
     bool _enumerateInterfaces();
-    void _closeDevice();
-    bool _getDeviceId();
-
-    const UsbIpEndpoint* _findEndpoint(uint8_t address) const;
-    int  _printerIfaceNum() const;
-
-    int _bulkTransfer(uint8_t endpoint, uint8_t* buffer, size_t length, uint32_t timeoutMs);
+    bool _tryClose();              // true once the device is fully closed
+    void _resetDeviceFields();
+    static String _strDesc(const usb_str_desc_t* d);
 };

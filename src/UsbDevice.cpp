@@ -1,17 +1,40 @@
 #include "UsbDevice.h"
 #include "EspUsbIpLog.h"
+#include <esp_heap_caps.h>
+
+// Enumeration filter: runs inside the host library right after the device descriptor has
+// been read, so seeing it proves reset, addressing and the first descriptor read worked.
+// It only records the descriptor; the host task logs it (this callback must not block).
+static volatile bool    g_enumSeen = false;
+static usb_device_desc_t g_enumDesc;
+
+static bool enumFilter(const usb_device_desc_t* desc, uint8_t* bConfigurationValue) {
+    g_enumDesc = *desc;
+    g_enumSeen = true;
+    *bConfigurationValue = 1;
+    return true;
+}
 
 UsbDevice::UsbDevice()
     : _state(DEVICE_DISCONNECTED), _maintenanceMode(false),
-      _vendorId(0), _productId(0),
-      _taskHandle(nullptr), _clientHandle(nullptr), _deviceHandle(nullptr),
-      _epOut(0), _epIn(0), _epOutMPS(64), _epInMPS(64), _speed(USB_SPEED_FULL),
-      _ifaceCount(0), _epCount(0),
+      _vendorId(0), _productId(0), _devAddr(0),
+      _hostTask(nullptr), _clientHandle(nullptr), _deviceHandle(nullptr),
+      _devMtx(nullptr),
+      _gone(false), _closeReq(false), _closeStartMs(0), _relIdx(0), _pendingAddr(-1),
+      _speed(USB_SPEED_FULL), _ifaceCount(0), _epCount(0),
       _devDescLen(0), _cfgDescLen(0) {}
 
+// ── Lifecycle ────────────────────────────────────────────────────────────────
+
 bool UsbDevice::begin() {
+    if (_clientHandle) return true;
+
+    _devMtx = xSemaphoreCreateMutex();
+    if (!_devMtx) { _USBIP_LOGE("USB out of memory (mutex)"); return false; }
+
     usb_host_config_t hostCfg = { .skip_phy_setup = false,
-                                  .intr_flags = ESP_INTR_FLAG_LEVEL1 };
+                                  .intr_flags = ESP_INTR_FLAG_LEVEL1,
+                                  .enum_filter_cb = enumFilter };
     if (usb_host_install(&hostCfg) != ESP_OK) {
         _USBIP_LOGE("USB Host install failed");
         return false;
@@ -19,48 +42,98 @@ bool UsbDevice::begin() {
 
     usb_host_client_config_t clientCfg = {
         .is_synchronous = false,
-        .max_num_event_msg = 5,
+        .max_num_event_msg = 15,
         .async = { .client_event_callback = _clientEventCallback,
                    .callback_arg = this }
     };
     if (usb_host_client_register(&clientCfg, &_clientHandle) != ESP_OK) {
         _USBIP_LOGE("USB Client register failed");
+        usb_host_uninstall();
         return false;
     }
 
-    BaseType_t core = (xPortGetCoreID() ^ 1);
-    xTaskCreatePinnedToCore(_deviceTask, "usb_host", 8192, this, 5, &_taskHandle, core);
-    _USBIP_LOGI("USB Host ready (core %d), waiting for device...", (int)core);
+    xTaskCreatePinnedToCore(_hostTaskFn, "usb_host", USBIP_STACK_USB, this,
+                            USBIP_PRIO_USB, &_hostTask, USBIP_CORE);
+    _USBIP_LOGI("USB Host ready (core %d, free DMA heap %u B), waiting for device...", USBIP_CORE,
+                (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
     return true;
 }
 
-void UsbDevice::stop() {
-    if (_taskHandle) {
-        vTaskSuspend(_taskHandle);
-        _USBIP_LOGI("USB Host task suspended");
+void UsbDevice::end() {
+    if (!_clientHandle) return;
+    // Let the client task finish closing a present device before it is stopped.
+    if (_deviceHandle) {
+        _gone = true; _state = DEVICE_DISCONNECTED;
+        _closeStartMs = millis(); _relIdx = 0; _closeReq = true;
+        for (int i = 0; i < 400 && _deviceHandle; i++) vTaskDelay(pdMS_TO_TICKS(10));
     }
+    if (_hostTask) { vTaskDelete(_hostTask); _hostTask = nullptr; }
+    usb_host_client_deregister(_clientHandle);
+    _clientHandle = nullptr;
+    usb_host_uninstall();
+    if (_devMtx) { vSemaphoreDelete(_devMtx); _devMtx = nullptr; }
+    _USBIP_LOGI("USB Host uninstalled");
+}
+
+void UsbDevice::stop() {
+    if (_hostTask) vTaskSuspend(_hostTask);
+    _USBIP_LOGI("USB Host task suspended");
 }
 
 void UsbDevice::start() {
-    if (_taskHandle) {
-        vTaskResume(_taskHandle);
-        _USBIP_LOGI("USB Host task resumed");
-    }
+    if (_hostTask) vTaskResume(_hostTask);
+    _USBIP_LOGI("USB Host task resumed");
 }
 
-void UsbDevice::_deviceTask(void* arg) {
+// One task services both the host library (enumeration, hot-plug) and the client
+// (device events and every transfer completion). The library is polled without
+// blocking and the client waits only a few milliseconds, so a completion callback
+// runs the moment its event arrives while library events are still serviced often.
+void UsbDevice::_hostTaskFn(void* arg) {
     UsbDevice* self = static_cast<UsbDevice*>(arg);
+    const uint32_t start = millis();
+    uint32_t lastAdopt = 0;
+    bool hinted = false;
     for (;;) {
-        self->_poll();
-        vTaskDelay(pdMS_TO_TICKS(10));
+        uint32_t flags = 0;
+        usb_host_lib_handle_events(0, &flags);
+        if (g_enumSeen) {
+            g_enumSeen = false;
+            _USBIP_LOGD("USB enumeration: device descriptor read (VID:0x%04X PID:0x%04X class 0x%02X, "
+                        "USB %x.%02x, ep0 mps %u)", g_enumDesc.idVendor, g_enumDesc.idProduct,
+                        g_enumDesc.bDeviceClass, g_enumDesc.bcdUSB >> 8, g_enumDesc.bcdUSB & 0xFF,
+                        g_enumDesc.bMaxPacketSize0);
+        }
+        if (flags) _USBIP_LOGD("USB host library event flags 0x%02X", (unsigned)flags);   // NO_CLIENTS / ALL_FREE
+
+        // While closing, wake regularly: the host stack frees the device only after the
+        // completion callbacks of its queued transfers have run on this very task.
+        usb_host_client_handle_events(self->_clientHandle, pdMS_TO_TICKS(USBIP_USB_POLL_MS));
+        if (self->_closeReq) self->_tryClose();
+
+        // NEW_DEV only reaches clients registered when enumeration completes. A device that
+        // was already plugged in at boot (or whose event was lost) would otherwise never be
+        // picked up, so look for enumerated devices we do not hold, now and twice a second.
+        if (!self->_deviceHandle && !self->_closeReq && millis() - lastAdopt >= 500) {
+            lastAdopt = millis();
+            self->_adoptExistingDevice();
+        }
+
+        if (!hinted && !self->_everSeen && millis() - start > 10000) {
+            hinted = true;
+            usb_host_lib_info_t li = {};
+            usb_host_lib_info(&li);
+            _USBIP_LOGW("USB no device detected after 10 s (host lib: %d device(s), %d client(s); "
+                        "free DMA heap %u B, largest block %u B). Check the cable, that it is the OTG "
+                        "port (not the UART port) and that the device gets VBUS power",
+                        li.num_devices, li.num_clients,
+                        (unsigned)heap_caps_get_free_size(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL),
+                        (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL));
+        }
     }
 }
 
-void UsbDevice::_poll() {
-    if (!_clientHandle) return;
-    usb_host_lib_handle_events(0, NULL);
-    usb_host_client_handle_events(_clientHandle, 0);
-}
+// ── Client events (usb_host task) ─────────────────────────────────────────────
 
 void UsbDevice::_clientEventCallback(const usb_host_client_event_msg_t* msg, void* arg) {
     static_cast<UsbDevice*>(arg)->_handleClientEvent(msg);
@@ -68,63 +141,110 @@ void UsbDevice::_clientEventCallback(const usb_host_client_event_msg_t* msg, voi
 
 void UsbDevice::_handleClientEvent(const usb_host_client_event_msg_t* msg) {
     if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
-        _USBIP_LOGI("USB Device detected addr=%d", msg->new_dev.address);
-        if (_state == DEVICE_DISCONNECTED)
-            _openDevice(msg->new_dev.address);
+        _everSeen = true;
+        _USBIP_LOGD("USB Device detected addr=%d", msg->new_dev.address);
+        if (!_deviceHandle && !_closeReq) _openDevice(msg->new_dev.address);
+        else                              _pendingAddr = msg->new_dev.address;   // retry after the close finishes
     } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+        if (!_deviceHandle || msg->dev_gone.dev_hdl != _deviceHandle) return;   // not the device we hold
         _USBIP_LOGW("USB Device disconnected");
-        _closeDevice();
+        _gone = true;
+        _state = DEVICE_DISCONNECTED;
+        _closeReq = true;
+        _closeStartMs = millis();
+        _relIdx = 0;
+        if (_goneCb) _goneCb();
     }
 }
 
+String UsbDevice::_strDesc(const usb_str_desc_t* d) {
+    if (!d || d->bLength < 2) return String();
+    String s;
+    int n = (d->bLength - 2) / 2;
+    for (int i = 0; i < n; i++) {
+        uint16_t c = d->wData[i];
+        s += (c >= 0x20 && c < 0x7F) ? (char)c : '?';
+    }
+    return s;
+}
+
+void UsbDevice::_adoptExistingDevice() {
+    uint8_t addrs[4];
+    int n = 0;
+    esp_err_t err = usb_host_device_addr_list_fill(sizeof(addrs), addrs, &n);
+    static int shown = 0;                       // report the first few attempts: silence would hide a failure
+    if (shown < 6 && (err != ESP_OK || n > 0 || shown == 0)) {
+        shown++;
+        _USBIP_LOGD("USB scan for already-enumerated devices: %s, %d found", esp_err_to_name(err), n);
+    }
+    if (err != ESP_OK || n <= 0) return;
+    _everSeen = true;
+    _USBIP_LOGI("USB Device already enumerated by the host (addr=%d): opening it", addrs[0]);
+    _openDevice(addrs[0]);
+}
+
 bool UsbDevice::_openDevice(uint8_t devAddr) {
-    if (usb_host_device_open(_clientHandle, devAddr, &_deviceHandle) != ESP_OK) {
+    usb_device_handle_t h = nullptr;
+    if (usb_host_device_open(_clientHandle, devAddr, &h) != ESP_OK) {
         _USBIP_LOGE("USB Cannot open device");
         return false;
     }
-    _state = DEVICE_CONNECTED;
+    xSemaphoreTake(_devMtx, portMAX_DELAY);
+    _deviceHandle = h;
+    xSemaphoreGive(_devMtx);
+    _gone    = false;
+    _devAddr = devAddr;
+    _state   = DEVICE_CONNECTED;
 
     const usb_device_desc_t* devDesc;
     if (usb_host_get_device_descriptor(_deviceHandle, &devDesc) == ESP_OK) {
         _vendorId   = devDesc->idVendor;
         _productId  = devDesc->idProduct;
-        _devDescLen = sizeof(usb_device_desc_t);
+        _devDescLen = sizeof(usb_device_desc_t) < USBIP_DEV_DESC_SIZE ? sizeof(usb_device_desc_t)
+                                                                      : USBIP_DEV_DESC_SIZE;
         memcpy(_devDescBuf, devDesc, _devDescLen);
-        _USBIP_LOGI("USB VID:0x%04X PID:0x%04X", _vendorId, _productId);
-
-        _manufacturer = String("VID:0x") + String(_vendorId, HEX);
-        _product      = String("PID:0x") + String(_productId, HEX);
+        _USBIP_LOGD("USB VID:0x%04X PID:0x%04X", _vendorId, _productId);
     }
 
     const usb_config_desc_t* cfgDesc;
     if (usb_host_get_active_config_descriptor(_deviceHandle, &cfgDesc) == ESP_OK) {
-        if (cfgDesc->wTotalLength > CFG_DESC_BUF_SIZE)
+        if (cfgDesc->wTotalLength > USBIP_CFG_DESC_SIZE)
             _USBIP_LOGW("USB configuration descriptor is %u bytes, stored copy truncated to %d",
-                        cfgDesc->wTotalLength, CFG_DESC_BUF_SIZE);
-        _cfgDescLen = min((uint16_t)CFG_DESC_BUF_SIZE, cfgDesc->wTotalLength);
+                        cfgDesc->wTotalLength, USBIP_CFG_DESC_SIZE);
+        _cfgDescLen = min((uint16_t)USBIP_CFG_DESC_SIZE, cfgDesc->wTotalLength);
         memcpy(_cfgDescBuf, cfgDesc, _cfgDescLen);
     }
 
     usb_device_info_t info;
-    _speed = (usb_host_device_info(_deviceHandle, &info) == ESP_OK) ? info.speed : USB_SPEED_FULL;
+    if (usb_host_device_info(_deviceHandle, &info) == ESP_OK) {
+        _speed        = info.speed;
+        _manufacturer = _strDesc(info.str_desc_manufacturer);
+        _product      = _strDesc(info.str_desc_product);
+        _serial       = _strDesc(info.str_desc_serial_num);
+    } else {
+        _speed = USB_SPEED_FULL;
+    }
+    if (_manufacturer.isEmpty()) _manufacturer = String("VID:0x") + String(_vendorId, HEX);
+    if (_product.isEmpty())      _product      = String("PID:0x") + String(_productId, HEX);
+    _USBIP_LOGI("USB %s / %s", _manufacturer.c_str(), _product.c_str());
 
     if (!_enumerateInterfaces()) {
         _USBIP_LOGE("USB No usable interface found or cannot claim");
-        _closeDevice();
+        _gone = true; _state = DEVICE_DISCONNECTED;
+        _closeReq = true; _closeStartMs = millis(); _relIdx = 0;
         return false;
     }
 
-    _getDeviceId();   // no-op unless a printer-class interface was claimed
     _state = DEVICE_READY;
     _USBIP_LOGI("USB Device ready (speed=%s, %d interface(s), %d endpoint(s))",
                 _speed == USB_SPEED_LOW ? "low" : "full", _ifaceCount, _epCount);
     return true;
 }
 
-// Walk every interface in the active configuration (alternate setting 0
-// only), claiming each one and recording its class/subclass/protocol plus
-// every bulk/interrupt endpoint it exposes. Isochronous endpoints and
-// non-default alternate settings are skipped — see README's scope notes.
+// Walk every interface in the active configuration (alternate setting 0 only),
+// claiming each one and recording its class triple plus every bulk/interrupt
+// endpoint it exposes. Isochronous endpoints and non-default alternate settings
+// are skipped (out of scope).
 bool UsbDevice::_enumerateInterfaces() {
     const usb_config_desc_t* cfgDesc;
     if (usb_host_get_active_config_descriptor(_deviceHandle, &cfgDesc) != ESP_OK)
@@ -148,14 +268,21 @@ bool UsbDevice::_enumerateInterfaces() {
                 if (err == ESP_OK) {
                     _ifaces[_ifaceCount++] = { iface->bInterfaceNumber, iface->bInterfaceClass,
                                                 iface->bInterfaceSubClass, iface->bInterfaceProtocol };
-                    _USBIP_LOGI("USB Interface #%d class=0x%02X/0x%02X/0x%02X claimed",
+                    _USBIP_LOGD("USB Interface #%d class=0x%02X/0x%02X/0x%02X claimed",
                                 iface->bInterfaceNumber, iface->bInterfaceClass,
                                 iface->bInterfaceSubClass, iface->bInterfaceProtocol);
 
-                    int epOff = offset + desc->bLength;
-                    for (int i = 0; i < iface->bNumEndpoints && epOff < total; i++) {
+                    // Class-specific descriptors (HID, CDC functional, ...) sit between the
+                    // interface and its endpoints, so scan until the next interface and count
+                    // only real endpoint descriptors.
+                    int epOff  = offset + desc->bLength;
+                    int epSeen = 0;
+                    while (epOff < total && epSeen < iface->bNumEndpoints) {
                         const usb_standard_desc_t* raw = (const usb_standard_desc_t*)(p + epOff);
+                        if (raw->bLength == 0) break;
+                        if (raw->bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) break;
                         if (raw->bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
+                            epSeen++;
                             const usb_ep_desc_t* ep = (const usb_ep_desc_t*)raw;
                             usb_transfer_type_t xtype = USB_EP_DESC_GET_XFERTYPE(ep);
                             if (xtype == USB_TRANSFER_TYPE_ISOCHRONOUS)
@@ -164,21 +291,11 @@ bool UsbDevice::_enumerateInterfaces() {
                             if ((xtype == USB_TRANSFER_TYPE_BULK || xtype == USB_TRANSFER_TYPE_INTR) &&
                                 _epCount < USBIP_MAX_EPS) {
                                 _eps[_epCount++] = { ep->bEndpointAddress, (uint8_t)xtype,
-                                                      ep->wMaxPacketSize, ep->bInterval };
-                                _USBIP_LOGI("USB %s ep=0x%02X mps=%d",
+                                                      ep->wMaxPacketSize, ep->bInterval,
+                                                      iface->bInterfaceClass };
+                                _USBIP_LOGD("USB %s ep=0x%02X mps=%d",
                                             xtype == USB_TRANSFER_TYPE_BULK ? "Bulk" : "Intr",
                                             ep->bEndpointAddress, ep->wMaxPacketSize);
-
-                                // Remember the first bulk pair for the legacy single-pair API.
-                                if (xtype == USB_TRANSFER_TYPE_BULK) {
-                                    if ((ep->bEndpointAddress & 0x80) && !_epIn) {
-                                        _epIn    = ep->bEndpointAddress;
-                                        _epInMPS = ep->wMaxPacketSize;
-                                    } else if (!(ep->bEndpointAddress & 0x80) && !_epOut) {
-                                        _epOut    = ep->bEndpointAddress;
-                                        _epOutMPS = ep->wMaxPacketSize;
-                                    }
-                                }
                             }
                         }
                         epOff += raw->bLength;
@@ -204,348 +321,111 @@ bool UsbDevice::getIfaceDesc(int i, uint8_t out[4]) const {
     return true;
 }
 
-const UsbIpEndpoint* UsbDevice::_findEndpoint(uint8_t address) const {
+const UsbIpEndpoint* UsbDevice::findEndpoint(uint8_t address) const {
     for (int i = 0; i < _epCount; i++)
         if (_eps[i].address == address) return &_eps[i];
     return nullptr;
 }
 
-int UsbDevice::_printerIfaceNum() const {
-    for (int i = 0; i < _ifaceCount; i++)
-        if (_ifaces[i].ifaceClass == USB_CLASS_PRINTER && _ifaces[i].ifaceSubClass == USB_SUBCLASS_PRINTER)
-            return _ifaces[i].ifaceNum;
-    return -1;
-}
+// ── Closing (usb_host task, between event batches) ────────────────────────────
 
-void UsbDevice::_closeDevice() {
-    if (_deviceHandle) {
-        // On unplug the stack completes every queued transfer with NO_DEVICE, but only
-        // while events are being processed. Releasing an interface or closing the device
-        // fails until then, so pump events and retry for a bounded time.
-        for (int i = 0; i < _ifaceCount; i++) {
-            for (int t = 0; t < 100; t++) {
-                if (usb_host_interface_release(_clientHandle, _deviceHandle,
-                                               _ifaces[i].ifaceNum) != ESP_ERR_INVALID_STATE) break;
-                usb_host_client_handle_events(_clientHandle, 10);
-            }
-        }
-        esp_err_t err = ESP_FAIL;
-        for (int t = 0; t < 100; t++) {
-            err = usb_host_device_close(_clientHandle, _deviceHandle);
-            if (err != ESP_ERR_INVALID_STATE) break;
-            usb_host_client_handle_events(_clientHandle, 10);
-        }
-        if (err != ESP_OK) _USBIP_LOGW("USB device close: %s", esp_err_to_name(err));
-        _deviceHandle = nullptr;
-    }
-    _state           = DEVICE_DISCONNECTED;
-    _maintenanceMode = false;
-    _epOut = _epIn   = 0;
-    _epOutMPS = _epInMPS = 64;
+void UsbDevice::_resetDeviceFields() {
     _ifaceCount = 0;
     _epCount    = 0;
     _devDescLen = _cfgDescLen = 0;
-    _deviceId = _manufacturer = _product = "";
+    _manufacturer = _product = _serial = "";
+    _vendorId = _productId = 0;
+    _devAddr = 0;
+}
+
+// Releases interfaces and closes the device without ever blocking. While transfers
+// are still queued the stack answers ESP_ERR_INVALID_STATE; the caller simply tries
+// again after the next batch of events, which delivers their completions.
+bool UsbDevice::_tryClose() {
+    if (_deviceHandle) {
+        while (_relIdx < _ifaceCount) {
+            esp_err_t err = usb_host_interface_release(_clientHandle, _deviceHandle,
+                                                       _ifaces[_relIdx].ifaceNum);
+            if (err == ESP_ERR_INVALID_STATE) {
+                if (millis() - _closeStartMs > USBIP_CLOSE_RETRY_MS) break;   // give up below
+                return false;
+            }
+            _relIdx++;
+        }
+
+        bool closed = false;
+        xSemaphoreTake(_devMtx, portMAX_DELAY);
+        esp_err_t err = usb_host_device_close(_clientHandle, _deviceHandle);
+        if (err != ESP_ERR_INVALID_STATE) { _deviceHandle = nullptr; closed = true; }
+        xSemaphoreGive(_devMtx);
+
+        if (!closed) {
+            if (millis() - _closeStartMs <= USBIP_CLOSE_RETRY_MS) return false;
+            _USBIP_LOGE("USB device could not be closed in time; abandoning handle");
+            xSemaphoreTake(_devMtx, portMAX_DELAY);
+            _deviceHandle = nullptr;
+            xSemaphoreGive(_devMtx);
+        } else if (err != ESP_OK) {
+            _USBIP_LOGW("USB device close: %s", esp_err_to_name(err));
+        }
+    }
+
+    _resetDeviceFields();
+    _state           = DEVICE_DISCONNECTED;
+    _maintenanceMode = false;
+    _closeReq        = false;
     _USBIP_LOGW("USB Device closed");
+
+    if (_pendingAddr >= 0) {                       // a device was plugged in while we were closing
+        int addr = _pendingAddr; _pendingAddr = -1;
+        _openDevice((uint8_t)addr);
+    }
+    return true;
 }
 
-bool UsbDevice::_getDeviceId() {
-    int ifaceNum = _printerIfaceNum();
-    if (ifaceNum < 0 || !_deviceHandle) return false;
+// ── Transfers ────────────────────────────────────────────────────────────────
 
-    usb_transfer_t* xfer;
-    if (usb_host_transfer_alloc(264, 0, &xfer) != ESP_OK) return false;
-
-    xfer->device_handle    = _deviceHandle;
-    xfer->bEndpointAddress = 0;
-    xfer->timeout_ms       = 1000;
-
-    usb_setup_packet_t* s = (usb_setup_packet_t*)xfer->data_buffer;
-    s->bmRequestType = 0xA1;  // Class | Interface | IN
-    s->bRequest      = USB_PRINTER_GET_DEVICE_ID;
-    s->wValue        = 0;
-    s->wIndex        = ifaceNum;
-    s->wLength       = 256;
-    xfer->num_bytes  = 256 + sizeof(usb_setup_packet_t);
-
-    volatile bool done = false;
-    xfer->callback = [](usb_transfer_t* t){ *(volatile bool*)t->context = true; };
-    xfer->context  = (void*)&done;
-
-    if (usb_host_transfer_submit_control(_clientHandle, xfer) == ESP_OK) {
-        for (int i = 0; i < 100 && !done; i++)
-            usb_host_client_handle_events(_clientHandle, 10);
-
-        if (done && xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
-            uint8_t* d = xfer->data_buffer + sizeof(usb_setup_packet_t);
-            int len = (d[0] << 8) | d[1];
-            if (len > 2 && len < 254)
-                _deviceId = String((char*)(d + 2), len - 2);
-            _USBIP_LOGI("USB Device ID: %s", _deviceId.c_str());
-        }
+esp_err_t UsbDevice::submitTransfer(usb_transfer_t* xfer) {
+    esp_err_t e = ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(_devMtx, portMAX_DELAY);
+    if (_deviceHandle && !_gone) {
+        xfer->device_handle = _deviceHandle;
+        e = usb_host_transfer_submit(xfer);
     }
-    usb_host_transfer_free(xfer);
-    return !_deviceId.isEmpty();
+    xSemaphoreGive(_devMtx);
+    return e;
 }
 
-// ── Internal bulk/interrupt transfer ──────────────────────────────────────────
-
-int UsbDevice::_bulkTransfer(uint8_t endpoint, uint8_t* buffer,
-                               size_t length, uint32_t timeoutMs) {
-    if (!_deviceHandle || length == 0) return -1;
-
-    uint16_t mps = 64;
-    if (const UsbIpEndpoint* e = _findEndpoint(endpoint)) mps = e->maxPacketSize;
-    else if (endpoint == _epIn)  mps = _epInMPS;
-    else if (endpoint == _epOut) mps = _epOutMPS;
-    size_t allocSize = ((length + mps - 1) / mps) * mps;
-
-    usb_transfer_t* xfer;
-    if (usb_host_transfer_alloc(allocSize, 0, &xfer) != ESP_OK) return -1;
-
-    bool isIn = (endpoint & 0x80);
-    if (!isIn) memcpy(xfer->data_buffer, buffer, length);
-
-    xfer->device_handle    = _deviceHandle;
-    xfer->bEndpointAddress = endpoint;
-    xfer->num_bytes        = length;
-    xfer->timeout_ms       = timeoutMs;
-
-    // Completion flag lives in xfer->context (not on the stack): the callback may
-    // fire after this function has returned if the transfer could not be cancelled.
-    xfer->callback = [](usb_transfer_t* t){ t->context = (void*)1; };
-    xfer->context  = nullptr;
-
-    esp_err_t err = usb_host_transfer_submit(xfer);
-    if (err != ESP_OK) { usb_host_transfer_free(xfer); return -1; }
-
-    unsigned long deadline = millis() + timeoutMs + 500;   // let the stack's own timeout fire first
-    while (!xfer->context && millis() < deadline)
-        usb_host_client_handle_events(_clientHandle, 10);
-
-    if (!xfer->context) {
-        // Still in flight: cancel it. Freeing an in-flight transfer corrupts memory
-        // (this was the mid-print reboot).
-        _USBIP_LOGW("USB transfer ep 0x%02X timed out, cancelling", endpoint);
-        usb_host_endpoint_halt(_deviceHandle, endpoint);
-        usb_host_endpoint_flush(_deviceHandle, endpoint);
-        unsigned long cancelDeadline = millis() + 2000;
-        while (!xfer->context && millis() < cancelDeadline)
-            usb_host_client_handle_events(_clientHandle, 10);
-        usb_host_endpoint_clear(_deviceHandle, endpoint);
-        if (!xfer->context) {
-            _USBIP_LOGE("USB transfer could not be cancelled; leaking it to stay safe");
-            return -1;   // never free a transfer the host stack still owns
-        }
+esp_err_t UsbDevice::submitControl(usb_transfer_t* xfer) {
+    esp_err_t e = ESP_ERR_INVALID_STATE;
+    xSemaphoreTake(_devMtx, portMAX_DELAY);
+    if (_deviceHandle && !_gone) {
+        xfer->device_handle = _deviceHandle;
+        e = usb_host_transfer_submit_control(_clientHandle, xfer);
     }
-
-    int result = -1;
-    if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
-        result = xfer->actual_num_bytes;
-        if (isIn) memcpy(buffer, xfer->data_buffer, result);
-    }
-    usb_host_transfer_free(xfer);
-    return result;
-}
-
-// ── Public transfer APIs ──────────────────────────────────────────────────────
-
-int UsbDevice::sendData(const uint8_t* data, size_t length) {
-    if (_maintenanceMode) {
-        _USBIP_LOGW("USB sendData rejected: locked for USB/IP");
-        return -1;
-    }
-    if (_state != DEVICE_READY || !_epOut) return -1;
-
-    _state = DEVICE_BUSY;
-    size_t sent = 0;
-    while (sent < length) {
-        size_t chunk = min((size_t)_epOutMPS, length - sent);
-        int n = _bulkTransfer(_epOut, (uint8_t*)(data + sent), chunk, 5000);
-        if (n < 0) { _state = DEVICE_READY; return (int)sent; }
-        sent += n;
-    }
-    _state = DEVICE_READY;
-    return (int)sent;
-}
-
-int UsbDevice::readData(uint8_t* buffer, size_t maxLength, uint32_t timeoutMs) {
-    if (!_epIn || !_deviceHandle) return -1;
-    return _bulkTransfer(_epIn, buffer, maxLength, timeoutMs);
-}
-
-int UsbDevice::sendMaintCommand(const uint8_t* cmd, size_t cmdLen,
-                                  uint8_t* response, size_t responseMaxLen,
-                                  uint32_t responseTimeoutMs) {
-    if (!_deviceHandle || !_epOut) return -1;
-    int n = _bulkTransfer(_epOut, (uint8_t*)cmd, cmdLen, 3000);
-    if (n < 0) return -1;
-
-    if (response && responseMaxLen > 0 && _epIn) {
-        delay(80);
-        return _bulkTransfer(_epIn, response, responseMaxLen, responseTimeoutMs);
-    }
-    return n;
-}
-
-int UsbDevice::submitControlTransfer(usb_setup_packet_t* setup,
-                                       uint8_t* data, size_t dataLen,
-                                       uint32_t timeoutMs) {
-    if (!_deviceHandle) return -1;
-
-    // SET_CONFIGURATION / SET_INTERFACE: device already configured — ack without forwarding
-    if ((setup->bmRequestType & 0x1F) == 0x00) {
-        if (setup->bRequest == USB_REQ_SET_CONFIGURATION ||
-            setup->bRequest == USB_REQ_SET_INTERFACE)
-            return 0;
-    }
-
-    bool isIn    = (setup->bmRequestType & 0x80) != 0;
-    size_t bufSz = sizeof(usb_setup_packet_t) + max(dataLen, (size_t)64);
-
-    usb_transfer_t* xfer;
-    if (usb_host_transfer_alloc(bufSz, 0, &xfer) != ESP_OK) return -1;
-
-    memcpy(xfer->data_buffer, setup, sizeof(usb_setup_packet_t));
-    if (!isIn && dataLen > 0 && data)
-        memcpy(xfer->data_buffer + sizeof(usb_setup_packet_t), data, dataLen);
-
-    xfer->device_handle    = _deviceHandle;
-    xfer->bEndpointAddress = 0;
-    xfer->num_bytes        = sizeof(usb_setup_packet_t) + (isIn ? max(dataLen, (size_t)0) : dataLen);
-    xfer->timeout_ms       = timeoutMs;
-
-    volatile bool done = false;
-    xfer->callback = [](usb_transfer_t* t){ *(volatile bool*)t->context = true; };
-    xfer->context  = (void*)&done;
-
-    if (usb_host_transfer_submit_control(_clientHandle, xfer) != ESP_OK) {
-        usb_host_transfer_free(xfer); return -1;
-    }
-
-    unsigned long deadline = millis() + timeoutMs;
-    while (!done && millis() < deadline)
-        usb_host_client_handle_events(_clientHandle, 10);
-
-    int result = -1;
-    if (done && xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
-        result = (int)xfer->actual_num_bytes - (int)sizeof(usb_setup_packet_t);
-        if (result < 0) result = 0;
-        if (isIn && data && result > 0)
-            memcpy(data, xfer->data_buffer + sizeof(usb_setup_packet_t), result);
-    }
-    usb_host_transfer_free(xfer);
-    return result;
-}
-
-int UsbDevice::submitBulkOut(const uint8_t* data, size_t len, uint32_t timeoutMs) {
-    if (!_epOut || !_deviceHandle) return -1;
-    return _bulkTransfer(_epOut, (uint8_t*)data, len, timeoutMs);
-}
-
-int UsbDevice::submitBulkIn(uint8_t* buf, size_t maxLen, uint32_t timeoutMs) {
-    if (!_epIn || !_deviceHandle) return -1;
-    return _bulkTransfer(_epIn, buf, maxLen, timeoutMs);
-}
-
-int UsbDevice::submitTransfer(uint8_t epAddr, uint8_t* buf, size_t len, uint32_t timeoutMs) {
-    if (!_deviceHandle) return -1;
-    return _bulkTransfer(epAddr, buf, len, timeoutMs);
-}
-
-usb_transfer_t* UsbDevice::beginInTransfer(uint8_t epAddr, size_t len,
-                                           usb_transfer_cb_t cb, void* ctx) {
-    if (!_deviceHandle || len == 0 || !(epAddr & 0x80)) return nullptr;
-
-    uint16_t mps = 64;
-    if (const UsbIpEndpoint* e = _findEndpoint(epAddr)) {
-        mps = e->maxPacketSize;
-        // An interrupt transfer is one packet. A request longer than the endpoint's packet
-        // size only completes on a short packet, so a device that sends exactly-MPS reports
-        // (an 8-byte HID keyboard report on a low-speed device) would sit unreported until
-        // the whole buffer filled. Asking for one packet returns each report promptly; a
-        // short read is always valid.
-        if (e->type == USB_TRANSFER_TYPE_INTR && mps > 0 && len > mps) len = mps;
-    }
-    if (mps == 0) mps = 64;
-    // The stack needs an IN length that is a multiple of MPS. Round DOWN (at least one
-    // packet): the device can then never send more than the client asked for, so no
-    // bytes are ever dropped - a short read is always valid, silently truncating is not.
-    size_t allocSize = (len / mps) * mps;
-    if (allocSize == 0) allocSize = mps;
-
-    usb_transfer_t* xfer;
-    if (usb_host_transfer_alloc(allocSize, 0, &xfer) != ESP_OK) return nullptr;
-
-    xfer->device_handle    = _deviceHandle;
-    xfer->bEndpointAddress = epAddr;
-    xfer->num_bytes        = allocSize;
-    xfer->timeout_ms       = 0;
-    xfer->callback         = cb;
-    xfer->context          = ctx;
-
-    esp_err_t err = usb_host_transfer_submit(xfer);
-    if (err != ESP_OK) {
-        _USBIP_LOGW("USB IN submit ep 0x%02X failed: %s", epAddr, esp_err_to_name(err));
-        usb_host_transfer_free(xfer);
-        return nullptr;
-    }
-    return xfer;
+    xSemaphoreGive(_devMtx);
+    return e;
 }
 
 void UsbDevice::cancelEndpoint(uint8_t epAddr) {
-    if (!_deviceHandle) return;
-    usb_host_endpoint_halt(_deviceHandle, epAddr);
-    usb_host_endpoint_flush(_deviceHandle, epAddr);
+    xSemaphoreTake(_devMtx, portMAX_DELAY);
+    if (_deviceHandle && !_gone) {
+        usb_host_endpoint_halt(_deviceHandle, epAddr);
+        usb_host_endpoint_flush(_deviceHandle, epAddr);
+    }
+    xSemaphoreGive(_devMtx);
 }
 
 void UsbDevice::clearEndpoint(uint8_t epAddr) {
-    if (_deviceHandle) usb_host_endpoint_clear(_deviceHandle, epAddr);
-}
-
-void UsbDevice::freeTransfer(usb_transfer_t* xfer) {
-    if (xfer) usb_host_transfer_free(xfer);
-}
-
-bool UsbDevice::softReset() {
-    int ifaceNum = _printerIfaceNum();
-    if (ifaceNum < 0 || !_deviceHandle) return false;
-
-    usb_transfer_t* xfer;
-    if (usb_host_transfer_alloc(8, 0, &xfer) != ESP_OK) return false;
-
-    xfer->device_handle    = _deviceHandle;
-    xfer->bEndpointAddress = 0;
-    xfer->timeout_ms       = 1000;
-
-    usb_setup_packet_t* s = (usb_setup_packet_t*)xfer->data_buffer;
-    s->bmRequestType = 0x21;  // Class | Interface | OUT
-    s->bRequest      = USB_PRINTER_SOFT_RESET;
-    s->wValue        = 0;
-    s->wIndex        = ifaceNum;
-    s->wLength       = 0;
-    xfer->num_bytes  = sizeof(usb_setup_packet_t);
-
-    volatile bool done = false;
-    xfer->callback = [](usb_transfer_t* t){ *(volatile bool*)t->context = true; };
-    xfer->context  = (void*)&done;
-
-    bool ok = false;
-    if (usb_host_transfer_submit_control(_clientHandle, xfer) == ESP_OK) {
-        for (int i = 0; i < 100 && !done; i++)
-            usb_host_client_handle_events(_clientHandle, 10);
-        ok = done && xfer->status == USB_TRANSFER_STATUS_COMPLETED;
-    }
-    usb_host_transfer_free(xfer);
-    if (ok) _USBIP_LOGI("USB Soft reset OK");
-    return ok;
+    xSemaphoreTake(_devMtx, portMAX_DELAY);
+    if (_deviceHandle && !_gone) usb_host_endpoint_clear(_deviceHandle, epAddr);
+    xSemaphoreGive(_devMtx);
 }
 
 void UsbDevice::setMaintenanceMode(bool active) {
     _maintenanceMode = active;
-    if (active && _state == DEVICE_READY)
-        _state = DEVICE_MAINTENANCE;
-    else if (!active && _state == DEVICE_MAINTENANCE)
-        _state = DEVICE_READY;
-    _USBIP_LOGI("USB Maintenance lock: %s", active ? "ON" : "OFF");
+    UsbDeviceState from = active ? DEVICE_READY : DEVICE_MAINTENANCE;
+    UsbDeviceState to   = active ? DEVICE_MAINTENANCE : DEVICE_READY;
+    _state.compare_exchange_strong(from, to);
+    _USBIP_LOGD("USB Maintenance lock: %s", active ? "ON" : "OFF");
 }
