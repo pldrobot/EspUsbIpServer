@@ -131,7 +131,7 @@ Any standard USB/IP client works; the tray app just automates discovery and atta
 | `kickClient()` | Force-disconnect the current client. |
 | `statusJson()` | JSON: attached state, current client, last 6 sessions. |
 
-Removed in 2.0: the printer helpers (`sendData`, `readData`, `sendMaintCommand`, `softReset`, `getDeviceId`), the blocking `submitControlTransfer` / `submitBulk*` calls, and `UsbDevice::task()`.
+Earlier prototypes also had printer helpers (`sendData`, `readData`, `sendMaintCommand`, `softReset`, `getDeviceId`), blocking `submitControlTransfer` / `submitBulk*` calls and `UsbDevice::task()`. They are not part of the 1.0 API.
 
 ---
 
